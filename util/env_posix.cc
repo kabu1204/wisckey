@@ -78,19 +78,17 @@ uint64_t AlignBackward(uint64_t x, uint64_t p){
 }
 
 int PreallocateFile(int fd, size_t size) {
-  if (ftruncate(fd, size) < 0) {
-    return errno;
-  }
 #if defined(__APPLE__)
-  fstore_t store;
-  std::memset(&store, 0, sizeof(store));
-  store.fst_flags = F_ALLOCATECONTIGUOUS;
-  store.fst_posmode = F_PEOFPOSMODE;
-  store.fst_length = static_cast<off_t>(size);
-  if (fcntl(fd, F_PREALLOCATE, &store) == -1) {
-    store.fst_flags = F_ALLOCATEALL;
+  struct stat file_stat;
+  if (fstat(fd, &file_stat) == 0 && file_stat.st_size < size) {
+    fstore_t store;
+    std::memset(&store, 0, sizeof(store));
+    store.fst_flags = F_ALLOCATECONTIGUOUS;
+    store.fst_posmode = F_PEOFPOSMODE;
+    store.fst_length = static_cast<off_t>(size - file_stat.st_size);
     if (fcntl(fd, F_PREALLOCATE, &store) == -1) {
-      return errno;
+      store.fst_flags = F_ALLOCATEALL;
+      fcntl(fd, F_PREALLOCATE, &store);
     }
   }
   if (ftruncate(fd, size) < 0) {
@@ -98,7 +96,11 @@ int PreallocateFile(int fd, size_t size) {
   }
   return 0;
 #else
-  return posix_fallocate(fd, 0, size);
+  if (ftruncate(fd, size) < 0) {
+    return errno;
+  }
+  (void)posix_fallocate(fd, 0, size);
+  return 0;
 #endif
 }
 
@@ -529,7 +531,7 @@ class PosixMmapAppendableFile final: public AppendableRandomAccessFile {
     assert(!(reserved_ & (page_size_ - 1)));
     if (preallocate) {
       if (PreallocateFile(fd_, reserved_) != 0) {
-        status_ = Status::IOError("failed to preallocate file");
+        status_ = Status::IOError("failed to size file");
         return;
       }
       char* addr = (char*)::mmap(mmap_base_, reserved_,
