@@ -29,7 +29,7 @@ The primary metric is the same-stage BlobDB/LevelDB mean `micros/op` ratio. This
 | fillrandom | 30.403 ± 0.963 | 29.836 ± 1.057 | 0.981 |
 | readrandom | 2.692 ± 0.114 | 2.652 ± 0.125 | 0.985 |
 
-The noise logs are in `/home/ubuntu/bench/results/noise_16k/` and the experiment is plotted in `./assets/blobdb_noise_16k.png`. A 1.5% interleaved difference is much smaller than the absolute drift seen between independent stages, so absolute cross-stage values are secondary evidence.
+The interleaved noise logs are retained with the benchmark artifacts and the experiment is plotted in `./assets/blobdb_noise_16k.png`. A 1.5% interleaved difference is much smaller than the absolute drift seen between independent stages, so absolute cross-stage values are secondary evidence.
 
 ## Fixes
 
@@ -57,9 +57,22 @@ The noise logs are in `/home/ubuntu/bench/results/noise_16k/` and the experiment
 - Files: `include/leveldb/env.h`, `util/env_posix.cc`, `db/blob_vlog_impl.cc`, `db/blob_vlog_gc.cc`, `table/vlog.cc`
 - Added an optional preallocation size to the appendable-file API; POSIX vlog files use `ftruncate`, `posix_fallocate`, one full-range mmap, and `MADV_SEQUENTIAL`. The sequential validation parser treats `key_len == 0` as end-of-data so an uncleanly closed preallocated zero tail is truncated during recovery.
 
+## Validation status
+
+The following status was unchanged across baseline, Fix 1, Fix 2, Fix 2b, and Fix 3:
+
+- `DBTest.*`: 58/58 passed.
+- `c_test`: passed.
+- `env_posix_test`: passed.
+- `VLOG_TEST.DBWrapperGC_FailAfterValueRewrite`: failed at baseline and continued to fail with SIGSEGV after each of the four commits. The assertion and failure behavior did not change.
+
+Fix 3's specific recovery validation interrupted a live writer with `kill -9`. The resulting preallocated vlog had a 227MB zero tail; restart completed recovery in `0.092 sec`, and the reopened database returned `1000 of 1000000 found` for random reads. This is evidence that the zero-tail validation guard avoids an unbounded scan after an unclean shutdown.
+
 ## Paired ratio table
 
 BlobDB/LevelDB mean `micros/op`; values below 1.0 mean BlobDB is faster. All rows use the repeat counts present in `./data/blobdb_ablation_summary.csv`.
+
+Figure 1 adds propagated uncertainty bars. For each ratio, the relative standard deviation is estimated as `sqrt(CV_blob^2 + CV_level^2)`, so the displayed error is the ratio multiplied by that relative standard deviation.
 
 | value | stage | fillseq | fillrandom | readrandom#1 | readseq#1 |
 |---:|---|---:|---:|---:|---:|
@@ -115,10 +128,20 @@ BlobDB mean `micros/op` ± sample standard deviation, with CV and repeat count. 
 
 ![Interleaved 16KB noise](./assets/blobdb_noise_16k.png)
 
-## Conclusions supported by these measurements
+## What the data does and does not support
 
-- The 128B BlobDB `fillseq` ratio remains approximately `1.24–1.29x` across the later stages; Fix 3 reports `1.269x`. The fixed overhead from the two-stage vlog/LSM write flow and its extra traversals/copies has not been removed.
-- BlobDB `readseq` remains substantially slower: approximately `3–6x` of LevelDB in the measured configurations. The scan path still performs per-value work; it has not been changed to batch or reorder vlog reads, and prefetch remains one task per value when enabled.
+### Supported by the data
+
+- Fix 2 and Fix 2b support a real reduction in point-get and scan fixed overhead. For 128B, `readrandom#1` moved from a baseline paired ratio of `1.006` to `0.742` in Fix 2, then remained `0.790` in Fix 2b and `0.816` in Fix 3. The BlobDB absolute mean moved from `2.518 us/op` to approximately `2.0 us/op`. Its BlobDB CV tightened from `13.9%` at baseline to `1.0–5.0%` in the later stages. The cross-stage consistency and variance reduction are stronger evidence than any one stage-to-stage difference.
+- The same pattern is present for 128B `readseq#1`: the paired ratio moved from `7.125` to `5.618–5.837`, the absolute BlobDB mean moved from `0.513` to approximately `0.407 us/op`, and the later-stage BlobDB CV was at or below approximately `2.3%` (with Fix 3 at `0.9%`). This supports reduced per-value fixed overhead, while the scan path remains much slower than LevelDB.
+- Fix 1 is justified by correctness: it propagates the status already returned by `GetLocked`. It is not a performance optimization and is not on the hot path in a way that supports attributing the apparent benchmark changes to Fix 1.
+- Fix 3 is justified by removing a structural risk and cost: repeated `ftruncate`/remap growth and delayed extent allocation in the append path, plus the unclean-shutdown zero-tail recovery hazard. Its kill-9 recovery evidence is documented above.
+
+### Not supported, or within noise
+
+- The stage-to-stage differences in `fillseq` and `fillrandom` are not attributable to a specific fix from this data. Their per-stage CVs reach approximately `8–21%`, and the interleaved 16KB experiment shows machine drift larger than the observed Fix 2 readrandom effect in absolute units.
+- In particular, the apparent Fix 1 improvements in the table—128B `readrandom#1` changing from `1.006` to `0.836`, and 16KB `fillseq` changing from `0.683` to `0.523`—must not be attributed to Fix 1. They are machine drift, not evidence of a Fix 1 performance effect.
+- The 1KB `fillseq` change from `0.924` to `0.848` in Fix 3 is not a performance conclusion. Fix 3's performance effect is not separable from the current noise level using these independent stages.
 - GC cost is not represented in this benchmark set because the 600-second GC interval was not reached and no GC workload was forced.
 
 ### Future work
@@ -131,5 +154,4 @@ BlobDB mean `micros/op` ± sample standard deviation, with CV and repeat count. 
 
 - Raw parsed rows: [`./data/blobdb_ablation_raw.csv`](./data/blobdb_ablation_raw.csv)
 - Paired summary: [`./data/blobdb_ablation_summary.csv`](./data/blobdb_ablation_summary.csv)
-- Benchmark driver and original logs remain outside the repository under `/home/ubuntu/bench/`.
-
+- The benchmark driver and original logs remain outside the repository and are not part of this commit.
