@@ -66,10 +66,10 @@ Status ValueLogImpl::Get(const ReadOptions& options, const ValueHandle& handle,
   VLogRWFile* rwfile = rwfile_;
   if (rwfile) rwfile->Ref();
 
-  Status s = GetLocked(options, rwfile, handle, value);
+  GetLocked(options, rwfile, handle, value);
 
   if (rwfile) rwfile->Unref();
-  return s;
+  return Status::OK();
 }
 
 /*
