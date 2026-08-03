@@ -9,6 +9,8 @@
 
 #include "table/vlog.h"
 
+#include <memory>
+
 #include "db/write_batch_internal.h"
 
 #include "table/value_batch.h"
@@ -153,6 +155,38 @@ Status VLogReader::Open(const Options& options, RandomAccessFile* file,
 
 VLogReader::~VLogReader() {
   delete rep_;
+}
+
+Status VLogReader::Get(const ReadOptions& options, uint32_t offset,
+                       uint32_t size, std::string* value) const {
+  if (offset >= rep_->limit || size > rep_->limit - offset) {
+    return Status::InvalidArgument("value log offset is out of limit");
+  }
+
+  char stack_scratch[512];
+  std::unique_ptr<char[]> heap_scratch;
+  char* scratch = stack_scratch;
+  if (size > sizeof(stack_scratch)) {
+    heap_scratch.reset(new char[size]);
+    scratch = heap_scratch.get();
+  }
+
+  Slice result;
+  Status s = rep_->file->Read(offset, size, &result, scratch);
+  if (!s.ok()) {
+    return s;
+  }
+
+  uint32_t key_len;
+  uint32_t value_len;
+  const char* p =
+      DecodeEntry(result.data(), result.data() + result.size(), &key_len,
+                  &value_len);
+  if (p == nullptr) {
+    return Status::Corruption("corrupted vlog entry");
+  }
+  value->assign(p + key_len, value_len);
+  return Status::OK();
 }
 
 bool VLogReaderIterator::ParseCurrentEntry(uint32_t size) {

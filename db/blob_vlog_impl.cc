@@ -78,7 +78,7 @@ Status ValueLogImpl::Get(const ReadOptions& options, const ValueHandle& handle,
 Status ValueLogImpl::GetLocked(const ReadOptions& options, VLogRWFile* rwfile,
                                const ValueHandle& handle, std::string* value) {
   rwlock_.AssertRLockHeld();
-  Iterator* iter;
+  Cache::Handle* cache_handle = nullptr;
 
   if (!rwfile || handle.table_ != rwfile->FileNumber()) {
     /*
@@ -89,8 +89,11 @@ Status ValueLogImpl::GetLocked(const ReadOptions& options, VLogRWFile* rwfile,
       if (handle.offset_ >= it->second.file_size) {
         return Status::InvalidArgument("value log offset is out of limit");
       }
-      iter = vlog_cache_->NewIterator(options, handle.table_,
-                                      it->second.file_size);
+      Status s = vlog_cache_->FindReader(handle.table_, it->second.file_size,
+                                          &cache_handle);
+      if (!s.ok()) {
+        return s;
+      }
     } else {
       return Status::NotFound("value log number not exists");
     }
@@ -103,29 +106,20 @@ Status ValueLogImpl::GetLocked(const ReadOptions& options, VLogRWFile* rwfile,
           handle.offset_, rwfile->Offset());
       return Status::InvalidArgument("value log offset is out of limit");
     }
-    iter = rwfile->NewIterator(options);
   }
 
-  {
-    // unlock when reading from disk
-    rwlock_.RUnlock();
-    std::string handle_encoding;
-    handle.EncodeTo(&handle_encoding);
-    iter->Seek(handle_encoding);  // expensive
-    if (iter->Valid()) {
-      const Slice v = iter->value();
-      value->assign(v.data(), v.size());
-    } else {
-      Status s = Status::NotFound("value not found", iter->status().ToString());
-      delete iter;
-      rwlock_.RLock();
-      return s;
-    }
-    delete iter;
-    rwlock_.RLock();
+  // Pin the cache entry while holding rwlock_, then unlock during IO.
+  rwlock_.RUnlock();
+  Status s;
+  if (cache_handle != nullptr) {
+    s = vlog_cache_->Get(options, cache_handle, handle.offset_, handle.size_,
+                         value);
+    vlog_cache_->Release(cache_handle);
+  } else {
+    s = rwfile->Get(options, handle.offset_, handle.size_, value);
   }
-
-  return Status::OK();
+  rwlock_.RLock();
+  return s;
 }
 
 /*

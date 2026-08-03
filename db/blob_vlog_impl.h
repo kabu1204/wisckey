@@ -110,6 +110,11 @@ class VLogRWFile {
     return iter;
   }
 
+  Status Get(const ReadOptions& options, uint32_t offset, uint32_t size,
+             std::string* value) {
+    return reader_->Get(options, offset, size, value);
+  }
+
   uint32_t Offset() const { return builder_->Offset(); }
   uint32_t FileSize() const { return builder_->FileSize(); }
   uint64_t FileNumber() const { return number_; }

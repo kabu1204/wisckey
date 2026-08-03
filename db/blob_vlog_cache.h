@@ -33,12 +33,18 @@ class VLogCache {
              uint64_t file_size, const Slice& k, void* arg,
              void (*handle_result)(void*, const Slice&, const Slice&));
 
+  Status FindReader(uint64_t file_number, uint64_t file_size,
+                    Cache::Handle** handle);
+
+  Status Get(const ReadOptions& options, Cache::Handle* handle,
+             uint32_t offset, uint32_t size, std::string* value);
+
+  void Release(Cache::Handle* handle);
+
   // Evict any entry for the specified file number
   void Evict(uint64_t file_number);
 
  private:
-  Status FindReader(uint64_t file_number, uint64_t file_size, Cache::Handle** handle);
-
   Env* const env_;
   const std::string dbname_;
   const Options& options_;
