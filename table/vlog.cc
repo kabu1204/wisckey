@@ -15,8 +15,6 @@
 
 namespace leveldb {
 
-constexpr size_t VLogReaderIterator::kRaSize;
-
 struct VLogBuilder::Rep {
   Rep(const Options& opt, AppendableRandomAccessFile* f)
       : options(opt), file(f) {}
@@ -165,82 +163,40 @@ bool VLogReaderIterator::ParseCurrentEntry(uint32_t size) {
   uint32_t key_len, val_len;
 
   if (size == 0) {
-    /*
-     * Sequential-scan path (SeekToFirst/Next). The previous implementation
-     * issued two reads per record: a 10-byte header read followed by a
-     * key+value read. Instead, maintain a read-ahead window so that many
-     * consecutive small records are served from a single larger read.
-     */
-    if (current_ < ra_base_ || current_ >= ra_base_ + ra_len_) {
-      ra_base_ = current_;
-      size_t want = std::min<size_t>(kRaSize, limit_ - current_);
-      status_ = file_->Read(current_, want, &result, ra_buf_);
-      if (!status_.ok()) return false;
-      ra_len_ = result.size();
-      if (result.data() != ra_buf_) {
-        std::memcpy(ra_buf_, result.data(), ra_len_);
-      }
+    status_ = file_->Read(current_, std::min<size_t>(10, limit_ - current_),
+                          &result, buf_);  // TODO: opt
+    if (!status_.ok()) {
+      return false;
     }
-    size_t off = current_ - ra_base_;
-    p = DecodeEntry(ra_buf_ + off, ra_buf_ + ra_len_, &key_len, &val_len);
-    size_t header_size = (p == nullptr) ? 0
-                                        : static_cast<size_t>(p - (ra_buf_ + off));
-    size_t entry_size = header_size + key_len + val_len;
-
-    if (p == nullptr || off + entry_size > ra_len_) {
-      /*
-       * The record header is truncated, or (the common case) the record
-       * straddles the read-ahead window boundary: DecodeEntry returns nullptr
-       * because its key+value-fits check is evaluated against the window end,
-       * not the file end. Re-read the header with the FILE limit so the size
-       * check passes, then read the whole record directly.
-       */
-      status_ = file_->Read(current_,
-                            std::min<size_t>(10, limit_ - current_), &result,
-                            buf_);
-      if (!status_.ok()) return false;
-      p = DecodeEntry(result.data(), result.data() - current_ + limit_,
-                      &key_len, &val_len);
-      if (p == nullptr) {
-        status_ = Status::Corruption("corrupted vlog entry");
-        return false;
-      }
-      header_size = static_cast<size_t>(p - result.data());
-      entry_size = header_size + key_len + val_len;
-      if (entry_size > buf_size_) {
-        delete[] buf_;
-        buf_size_ = entry_size;
-        buf_ = new char[buf_size_];
-      }
-      scratch = buf_;
-      status_ = file_->Read(current_, entry_size, &result, scratch);
-      if (!status_.ok()) return false;
-      p = DecodeEntry(result.data(), result.data() + result.size(), &key_len,
-                      &val_len);
-      if (p == nullptr) {
-        status_ = Status::Corruption("corrupted vlog entry");
-        return false;
-      }
-      key_.assign(p, key_len);
-      value_ = Slice(p + key_len, val_len);
-      parsed_entry_size_ = static_cast<uint32_t>(entry_size);
-      return true;
+    p = DecodeEntry(result.data(), result.data() - current_ + limit_, &key_len,
+                    &val_len);
+    if (p == nullptr) {
+      status_ = Status::Corruption("corrupted vlog entry");
+      return false;
     }
 
-    key_.assign(p, key_len);
-    value_ = Slice(p + key_len, val_len);
-    parsed_entry_size_ = static_cast<uint32_t>(entry_size);
-    return true;
+    size = key_len + val_len + (p - result.data());
+    if (key_len + val_len > buf_size_) {
+      delete[] buf_;
+      buf_size_ = key_len + val_len;
+      buf_ = new char[buf_size_];
+    }
+    scratch = buf_;
+    status_ = file_->Read(current_ + (p - result.data()), key_len + val_len,
+                          &result, scratch);
+    p = result.data();
+  } else {
+    if (size > buf_size_) {
+      delete[] buf_;
+      buf_size_ = size;
+      buf_ = new char[buf_size_];
+    }
+    scratch = buf_;
+    status_ = file_->Read(current_, size, &result, scratch);
+    p = DecodeEntry(result.data(), result.data() + result.size(), &key_len,
+                    &val_len);
   }
-  if (size > buf_size_) {
-    delete[] buf_;
-    buf_size_ = size;
-    buf_ = new char[buf_size_];
-  }
-  scratch = buf_;
-  status_ = file_->Read(current_, size, &result, scratch);
-  p = DecodeEntry(result.data(), result.data() + result.size(), &key_len,
-                  &val_len);
+
   if (!status_.ok()) {
     return false;
   }
@@ -259,13 +215,9 @@ VLogReaderIterator::VLogReaderIterator(const RandomAccessFile* file,
     : file_(file),
       limit_(limit),
       buf_size_(buf_size),
-      buf_(new char[buf_size]),
-      ra_buf_(new char[kRaSize]) {}
+      buf_(new char[buf_size]) {}
 
-VLogReaderIterator::~VLogReaderIterator() {
-  delete[] buf_;
-  delete[] ra_buf_;
-}
+VLogReaderIterator::~VLogReaderIterator() { delete[] buf_; }
 
 bool VLogReaderIterator::Valid() const { return valid_; }
 
@@ -333,30 +285,8 @@ Status VLogReader::InternalGet(const ReadOptions& option, const Slice& key, void
 }
 
 Status VLogReader::ReadValue(const ValueHandle& handle, std::string* value) const {
-  uint32_t offset = handle.offset_;
   uint32_t n = handle.size_;
-
-  // size_ == 0 means "size unknown": derive it from the record header. This
-  // matches the iterator path and is used by recovery/validation.
-  if (n == 0) {
-    if (offset + 2 > rep_->limit) {
-      return Status::NotFound("value log offset is out of limit");
-    }
-    char hdr[10];
-    Slice r;
-    Status s = rep_->file->Read(offset, std::min<size_t>(10, rep_->limit - offset),
-                                &r, hdr);
-    if (!s.ok()) return s;
-    uint32_t key_len, value_len;
-    // Validate against the file limit (not the 10-byte header buffer): we only
-    // need key_len/value_len here, the key+value bytes are read separately below.
-    const char* p = DecodeEntry(r.data(), r.data() - offset + rep_->limit,
-                                &key_len, &value_len);
-    if (p == nullptr) return Status::Corruption("corrupted vlog entry");
-    n = static_cast<uint32_t>((p - r.data()) + key_len + value_len);
-  }
-
-  if (offset + n > rep_->limit) {
+  if (n == 0 || handle.offset_ + n > rep_->limit) {
     return Status::NotFound("value log offset is out of limit");
   }
 
@@ -373,7 +303,7 @@ Status VLogReader::ReadValue(const ValueHandle& handle, std::string* value) cons
   }
 
   Slice result;
-  Status s = rep_->file->Read(offset, n, &result, scratch);
+  Status s = rep_->file->Read(handle.offset_, n, &result, scratch);
   if (!s.ok()) {
     return s;
   }

@@ -18,12 +18,8 @@ class VLogReaderIterator : public Iterator {
   const uint32_t limit_;
   uint32_t current_{0};
   Status status_;
-  char* buf_;          // growable scratch for single (large) record reads
+  char* buf_;
   size_t buf_size_;
-  char* ra_buf_;       // fixed read-ahead window for sequential scanning
-  static constexpr size_t kRaSize = 8192;
-  size_t ra_base_{0};  // file offset of ra_buf_[0]
-  size_t ra_len_{0};   // valid bytes in ra_buf_
   std::string key_;
   Slice value_;
   uint32_t parsed_entry_size_;
