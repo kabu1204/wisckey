@@ -208,6 +208,10 @@ bool VLogReaderIterator::ParseCurrentEntry(uint32_t size) {
       status_ = Status::Corruption("corrupted vlog entry");
       return false;
     }
+    if (key_len == 0) {
+      status_ = Status::OK();
+      return false;
+    }
 
     size = key_len + val_len + (p - result.data());
     if (key_len + val_len > buf_size_) {

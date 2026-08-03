@@ -320,7 +320,8 @@ Status ValueLogImpl::Recover() {
     LogAndApply(&edit);
   } else {
     s = env_->NewAppendableRandomAccessFile(
-        VLogFileName(dbname_, latest_rw_file), &file);
+        VLogFileName(dbname_, latest_rw_file), &file,
+        options_.blob_max_file_size);
     assert(s.ok());
     rwfile_ = new VLogRWFile(options_, file, latest_rw_file, true, offset,
                              num_entries);
@@ -437,7 +438,8 @@ Status ValueLogImpl::LogAndApply(BlobVersionEdit* edit) {
   if (edit->has_new_rw_file_) {
     AppendableRandomAccessFile* file;
     s = env_->NewAppendableRandomAccessFile(
-        VLogFileName(dbname_, edit->new_rw_file_), &file);
+        VLogFileName(dbname_, edit->new_rw_file_), &file,
+        options_.blob_max_file_size);
     rwfile_ = new VLogRWFile(options_, file, edit->new_rw_file_);
     rwfile_->Ref();
   }
@@ -683,7 +685,8 @@ Status ValueLogImpl::ValidateAndTruncate(uint64_t number, uint64_t* offset,
   VLogReader* reader;
 
   s = env_->GetFileSize(filename, file_size);
-  s = env_->NewAppendableRandomAccessFile(filename, &file);
+  s = env_->NewAppendableRandomAccessFile(filename, &file,
+                                          options_.blob_max_file_size);
   assert(s.ok());
   s = VLogReader::Open(options_, file, *file_size, &reader);
   if (!s.ok()) {

@@ -114,7 +114,8 @@ class LEVELDB_EXPORT Env {
                                    WritableFile** result);
 
   virtual Status NewAppendableRandomAccessFile(const std::string& filename,
-                                       AppendableRandomAccessFile** result){
+                                       AppendableRandomAccessFile** result,
+                                       uint64_t preallocate_size = 0){
     return Status::OK();
   }
 
@@ -403,9 +404,11 @@ class LEVELDB_EXPORT EnvWrapper : public Env {
     return target_->PageSize();
   }
   Status NewAppendableRandomAccessFile(const std::string& filename,
-                                               AppendableRandomAccessFile** result) override
+                                               AppendableRandomAccessFile** result,
+                                               uint64_t preallocate_size = 0) override
   {
-    return target_->NewAppendableRandomAccessFile(filename, result);
+    return target_->NewAppendableRandomAccessFile(filename, result,
+                                                   preallocate_size);
   }
 
   Status TruncateFile(const std::string& filename, uint64_t fileSize) override {
