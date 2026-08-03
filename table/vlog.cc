@@ -9,8 +9,6 @@
 
 #include "table/vlog.h"
 
-#include <memory>
-
 #include "db/write_batch_internal.h"
 
 #include "table/value_batch.h"
@@ -164,11 +162,13 @@ Status VLogReader::Get(const ReadOptions& options, uint32_t offset,
   }
 
   char stack_scratch[512];
-  std::unique_ptr<char[]> heap_scratch;
+  thread_local std::string reusable_scratch;
   char* scratch = stack_scratch;
   if (size > sizeof(stack_scratch)) {
-    heap_scratch.reset(new char[size]);
-    scratch = heap_scratch.get();
+    if (reusable_scratch.size() < size) {
+      reusable_scratch.resize(size);
+    }
+    scratch = &reusable_scratch[0];
   }
 
   Slice result;
