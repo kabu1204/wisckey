@@ -77,6 +77,31 @@ uint64_t AlignBackward(uint64_t x, uint64_t p){
   return x;
 }
 
+int PreallocateFile(int fd, size_t size) {
+  if (ftruncate(fd, size) < 0) {
+    return errno;
+  }
+#if defined(__APPLE__)
+  fstore_t store;
+  std::memset(&store, 0, sizeof(store));
+  store.fst_flags = F_ALLOCATECONTIGUOUS;
+  store.fst_posmode = F_PEOFPOSMODE;
+  store.fst_length = static_cast<off_t>(size);
+  if (fcntl(fd, F_PREALLOCATE, &store) == -1) {
+    store.fst_flags = F_ALLOCATEALL;
+    if (fcntl(fd, F_PREALLOCATE, &store) == -1) {
+      return errno;
+    }
+  }
+  if (ftruncate(fd, size) < 0) {
+    return errno;
+  }
+  return 0;
+#else
+  return posix_fallocate(fd, 0, size);
+#endif
+}
+
 // Helper class to limit resource usage to avoid exhaustion.
 // Currently used to limit read-only file descriptors and mmap file usage
 // so that we do not run out of file descriptors or virtual memory, or run into
@@ -503,8 +528,7 @@ class PosixMmapAppendableFile final: public AppendableRandomAccessFile {
 
     assert(!(reserved_ & (page_size_ - 1)));
     if (preallocate) {
-      if (ftruncate(fd_, reserved_) < 0 ||
-          posix_fallocate(fd_, 0, reserved_) != 0) {
+      if (PreallocateFile(fd_, reserved_) != 0) {
         status_ = Status::IOError("failed to preallocate file");
         return;
       }
