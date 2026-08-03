@@ -69,7 +69,7 @@ Status ValueLogImpl::Get(const ReadOptions& options, const ValueHandle& handle,
   Status s = GetLocked(options, rwfile, handle, value);
 
   if (rwfile) rwfile->Unref();
-  return Status::OK();
+  return s;
 }
 
 /*
@@ -78,54 +78,25 @@ Status ValueLogImpl::Get(const ReadOptions& options, const ValueHandle& handle,
 Status ValueLogImpl::GetLocked(const ReadOptions& options, VLogRWFile* rwfile,
                                const ValueHandle& handle, std::string* value) {
   rwlock_.AssertRLockHeld();
-  Iterator* iter;
 
-  if (!rwfile || handle.table_ != rwfile->FileNumber()) {
-    /*
-     * Get from read only files
-     */
-    auto it = ro_files_.find(handle.table_);
-    if (it != ro_files_.end()) {
-      if (handle.offset_ >= it->second.file_size) {
-        return Status::InvalidArgument("value log offset is out of limit");
-      }
-      iter = vlog_cache_->NewIterator(options, handle.table_,
-                                      it->second.file_size);
-    } else {
-      return Status::NotFound("value log number not exists");
-    }
-  } else {
-    /*
-     * Get from rwfile
-     */
+  if (rwfile && handle.table_ == rwfile->FileNumber()) {
     if (handle.offset_ >= rwfile->Offset()) {
       Log(options_.info_log, "value log offset %u is out of limit %u",
           handle.offset_, rwfile->Offset());
       return Status::InvalidArgument("value log offset is out of limit");
     }
-    iter = rwfile->NewIterator(options);
+    return rwfile->ReadValue(handle, value);
   }
 
-  {
-    // unlock when reading from disk
-    rwlock_.RUnlock();
-    std::string handle_encoding;
-    handle.EncodeTo(&handle_encoding);
-    iter->Seek(handle_encoding);  // expensive
-    if (iter->Valid()) {
-      const Slice v = iter->value();
-      value->assign(v.data(), v.size());
-    } else {
-      Status s = Status::NotFound("value not found", iter->status().ToString());
-      delete iter;
-      rwlock_.RLock();
-      return s;
-    }
-    delete iter;
-    rwlock_.RLock();
+  auto it = ro_files_.find(handle.table_);
+  if (it == ro_files_.end()) {
+    return Status::NotFound("value log number not exists");
   }
-
-  return Status::OK();
+  if (handle.offset_ >= it->second.file_size) {
+    return Status::InvalidArgument("value log offset is out of limit");
+  }
+  return vlog_cache_->ReadValue(handle.table_, it->second.file_size, handle,
+                                value);
 }
 
 /*
@@ -548,6 +519,27 @@ Iterator* ValueLogImpl::NewVLogFileIterator(const ReadOptions& options,
 
   if (rwfile) rwfile->Unref();
   return iter;
+}
+
+Status ValueLogImpl::ScanVLog(uint64_t number, uint64_t* scanned_bytes,
+                              uint64_t* num_records) {
+  *scanned_bytes = 0;
+  *num_records = 0;
+  Iterator* iter;
+  {
+    ReadLock l(&rwlock_);
+    iter = NewVLogFileIterator(ReadOptions(), number);
+  }
+  if (iter == nullptr) {
+    return Status::NotFound("value log number not exists");
+  }
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    *scanned_bytes += iter->key().size() + iter->value().size();
+    (*num_records)++;
+  }
+  Status s = iter->status();
+  delete iter;
+  return s;
 }
 
 static std::string Bytes2Size(uint64_t size) {

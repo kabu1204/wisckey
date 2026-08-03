@@ -590,6 +590,8 @@ class Benchmark {
         method = &Benchmark::ReadWhileWriting;
       } else if (name == Slice("compact")) {
         method = &Benchmark::Compact;
+      } else if (name == Slice("vlogscan")) {
+        method = &Benchmark::VLogScan;
       } else if (name == Slice("crc32c")) {
         method = &Benchmark::Crc32c;
       } else if (name == Slice("snappycomp")) {
@@ -1025,6 +1027,36 @@ class Benchmark {
   }
 
   void Compact(ThreadState* thread) { db_->CompactRange(nullptr, nullptr); }
+
+  // Sequentially scan the oldest read-only .vlog file end-to-end. Measures raw
+  // value-log sequential scan throughput (exercises VLogReaderIterator), with
+  // no LSM probes, so it isolates the vlog scan path.
+  void VLogScan(ThreadState* thread) {
+    if (FLAGS_blob == 0) {
+      thread->stats.AddMessage("(blob disabled)");
+      return;
+    }
+    BlobDB* blob_db = static_cast<BlobDB*>(db_);
+    // Scan every read-only file; aggregate bytes over the first one that
+    // exists. File numbers are small positive integers; try a few.
+    uint64_t bytes = 0;
+    uint64_t records = 0;
+    bool done = false;
+    for (uint64_t n = 1; n <= 64 && !done; n++) {
+      uint64_t b = 0, r = 0;
+      Status s = blob_db->ScanVLog(n, &b, &r);
+      if (s.ok() && r > 0) {
+        bytes = b;
+        records = r;
+        done = true;
+      }
+    }
+    thread->stats.FinishedSingleOp();
+    thread->stats.AddBytes(bytes);
+    char msg[160];
+    std::snprintf(msg, sizeof(msg), "(%llu records)", static_cast<unsigned long long>(records));
+    thread->stats.AddMessage(msg);
+  }
 
   void PrintStats(const char* key) {
     std::string stats;

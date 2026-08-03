@@ -63,15 +63,29 @@ Iterator* VLogCache::NewIterator(const ReadOptions& options,
 }
 
 Status VLogCache::Get(const ReadOptions& options, uint64_t file_number,
-                            uint64_t file_size, const Slice& k, void* arg,
-                            void (*handle_result)(void*, const Slice&,
-                                                  const Slice&)) {
+                             uint64_t file_size, const Slice& k, void* arg,
+                             void (*handle_result)(void*, const Slice&,
+                                                   const Slice&)) {
   Cache::Handle* handle = nullptr;
   Status s = FindReader(file_number, file_size, &handle);
   if (s.ok()) {
     VLogReader* t = reinterpret_cast<TableAndFile*>(cache_->Value(handle))->table;
     s = t->InternalGet(options, k, arg, handle_result);
     cache_->Release(handle);
+  }
+  return s;
+}
+
+Status VLogCache::ReadValue(uint64_t file_number, uint64_t file_size,
+                                    const ValueHandle& handle,
+                                    std::string* value) {
+  Cache::Handle* handle_c = nullptr;
+  Status s = FindReader(file_number, file_size, &handle_c);
+  if (s.ok()) {
+    VLogReader* t =
+        reinterpret_cast<TableAndFile*>(cache_->Value(handle_c))->table;
+    s = t->ReadValue(handle, value);
+    cache_->Release(handle_c);
   }
   return s;
 }

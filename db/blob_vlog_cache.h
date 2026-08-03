@@ -33,6 +33,10 @@ class VLogCache {
              uint64_t file_size, const Slice& k, void* arg,
              void (*handle_result)(void*, const Slice&, const Slice&));
 
+  // Direct point read avoiding per-Get iterator allocation.
+  Status ReadValue(uint64_t file_number, uint64_t file_size,
+                   const ValueHandle& handle, std::string* value);
+
   // Evict any entry for the specified file number
   void Evict(uint64_t file_number);
 

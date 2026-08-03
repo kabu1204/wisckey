@@ -67,6 +67,10 @@ class BlobDB : public DB {
 
   void ManualGC(uint64_t number);
 
+  // Sequentially scan all records of .vlog file "number" (no LSM probes).
+  Status ScanVLog(uint64_t number, uint64_t* scanned_bytes,
+                  uint64_t* num_records);
+
   void WaitVLogGC();
 
   Status VLogBGError();

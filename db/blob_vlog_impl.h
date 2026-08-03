@@ -110,6 +110,13 @@ class VLogRWFile {
     return iter;
   }
 
+  // Direct point read of the value referenced by "handle" without building an
+  // iterator. Should be called after Ref().
+  Status ReadValue(const ValueHandle& handle, std::string* value) {
+    assert(!closed_);
+    return reader_->ReadValue(handle, value);
+  }
+
   uint32_t Offset() const { return builder_->Offset(); }
   uint32_t FileSize() const { return builder_->FileSize(); }
   uint64_t FileNumber() const { return number_; }
@@ -177,6 +184,11 @@ class ValueLogImpl {
   GarbageCollection* PickGC(uint64_t number);
 
   void ManualGC(uint64_t number);
+
+  // Sequentially scan all records of a single .vlog file (no LSM probes). Used
+  // to measure raw value-log sequential scan throughput.
+  Status ScanVLog(uint64_t number, uint64_t* scanned_bytes,
+                  uint64_t* num_records);
 
   void RemoveObsoleteFiles() EXCLUSIVE_LOCKS_REQUIRED(rwlock_);
 

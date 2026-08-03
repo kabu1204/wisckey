@@ -284,6 +284,43 @@ Status VLogReader::InternalGet(const ReadOptions& option, const Slice& key, void
   return s;
 }
 
+Status VLogReader::ReadValue(const ValueHandle& handle, std::string* value) const {
+  uint32_t n = handle.size_;
+  if (n == 0 || handle.offset_ + n > rep_->limit) {
+    return Status::NotFound("value log offset is out of limit");
+  }
+
+  // Most values are small; read directly into a stack buffer to avoid a per-Get
+  // heap allocation (the previous path allocated a VLogReaderIterator plus a
+  // char[1024] scratch on every lookup). Fall back to the heap for large values.
+  constexpr size_t kStackBuf = 4096;
+  char stack_buf[kStackBuf];
+  char* scratch = stack_buf;
+  std::string heap_buf;
+  if (n > kStackBuf) {
+    heap_buf.resize(n);
+    scratch = &heap_buf[0];
+  }
+
+  Slice result;
+  Status s = rep_->file->Read(handle.offset_, n, &result, scratch);
+  if (!s.ok()) {
+    return s;
+  }
+  if (result.size() < n) {
+    return Status::Corruption("short read in vlog");
+  }
+
+  uint32_t key_len, value_len;
+  const char* p = DecodeEntry(result.data(), result.data() + n, &key_len,
+                              &value_len);
+  if (p == nullptr) {
+    return Status::Corruption("corrupted vlog entry");
+  }
+  value->assign(p + key_len, value_len);
+  return Status::OK();
+}
+
 bool VLogReader::Validate(uint64_t* offset, uint64_t* num_entries) {
   VLogReaderIterator* iter = NewIterator(ReadOptions());
   assert(iter != nullptr);

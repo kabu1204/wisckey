@@ -260,6 +260,11 @@ Status BlobDB::Open(const Options& options, const std::string& name,
 
 void BlobDB::ManualGC(uint64_t number) { vlog_->ManualGC(number); }
 
+Status BlobDB::ScanVLog(uint64_t number, uint64_t* scanned_bytes,
+                        uint64_t* num_records) {
+  return vlog_->ScanVLog(number, scanned_bytes, num_records);
+}
+
 Status BlobDB::VLogBGError() {
   MutexLock l(&vlog_->mutex_);
   return vlog_->bg_error_;

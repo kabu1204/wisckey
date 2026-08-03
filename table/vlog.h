@@ -64,6 +64,11 @@ class VLogReader {
 
   VLogReaderIterator* NewIterator(const ReadOptions&) const;
 
+  // Read the value of the record identified by "handle" directly, without
+  // constructing an iterator. This avoids a per-Get heap allocation and the
+  // iterator Seek machinery on the hot point-lookup path.
+  Status ReadValue(const ValueHandle& handle, std::string* value) const;
+
   /*
    * Iterate through the file, stop when !iter->Valid(),
    * storing the validated size and num_entries of the file in the arguments.
