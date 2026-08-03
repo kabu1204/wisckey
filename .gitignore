@@ -9,4 +9,5 @@ out/
 
 .cache
 .vscode
-compile_commands.json
+compile_commands.jsonbuild_*/
+testdb/

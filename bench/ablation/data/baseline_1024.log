@@ -1,0 +1,12 @@
+fillseq      :       6.267 micros/op;  158.3 MB/s
+readseq      :       0.648 micros/op; 1529.9 MB/s
+readseq      :       0.571 micros/op; 1736.3 MB/s
+readseq      :       0.413 micros/op; 2399.5 MB/s
+readreverse  :       0.730 micros/op; 1358.8 MB/s
+readreverse  :       0.761 micros/op; 1303.3 MB/s
+readreverse  :       0.728 micros/op; 1362.9 MB/s
+readrandom   :       3.084 micros/op;  321.6 MB/s (500000 of 500000 found)
+readrandom   :       2.696 micros/op;  367.8 MB/s (500000 of 500000 found)
+readrandom   :       3.048 micros/op;  325.4 MB/s (500000 of 500000 found)
+fillrandom   :       6.328 micros/op;  156.7 MB/s
+overwrite    :       6.177 micros/op;  160.6 MB/s

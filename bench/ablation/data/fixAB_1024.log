@@ -1,0 +1,15 @@
+fillseq      :       5.856 micros/op;  169.4 MB/s
+readseq      :       0.487 micros/op; 2034.6 MB/s
+readseq      :       0.318 micros/op; 3122.5 MB/s
+readseq      :       0.363 micros/op; 2728.8 MB/s
+readreverse  :       0.530 micros/op; 1872.3 MB/s
+readreverse  :       0.572 micros/op; 1735.4 MB/s
+readreverse  :       0.631 micros/op; 1572.5 MB/s
+readrandom   :       2.842 micros/op;  349.0 MB/s (500000 of 500000 found)
+readrandom   :       2.897 micros/op;  342.4 MB/s (500000 of 500000 found)
+readrandom   :       3.194 micros/op;  310.6 MB/s (500000 of 500000 found)
+vlogscan     :     322.000 micros/op; 12388.5 MB/s (4022 records)
+vlogscan     :     354.000 micros/op; 11268.7 MB/s (4022 records)
+vlogscan     :     309.000 micros/op; 12909.7 MB/s (4022 records)
+fillrandom   :       7.053 micros/op;  140.6 MB/s
+overwrite    :      11.398 micros/op;   87.0 MB/s
