@@ -15,6 +15,19 @@
 
 namespace leveldb {
 
+struct BlobDB::Writer {
+  explicit Writer(port::Mutex* mu) : done(false), cv(mu) {}
+
+  WriteOptions options;
+  WriteBatch* updates = nullptr;
+  WriteCallback* callback = nullptr;
+  WriteBatch small;
+  ValueBatch large;
+  Status status;
+  bool done;
+  port::CondVar cv;
+};
+
 class DivideHandler : public WriteBatch::Handler {
  public:
   DivideHandler() = default;
@@ -22,7 +35,7 @@ class DivideHandler : public WriteBatch::Handler {
 
   void Put(const Slice& key, const Slice& value) override {
     if (value.size() >= threshold) {
-      vb->Put(key, value);
+      vb->PutBorrowed(key, value);
     } else {
       small->Put(key, value);
     }
@@ -60,24 +73,69 @@ Status BlobDB::Write(const WriteOptions& options, WriteBatch* updates) {
 
 Status BlobDB::Write(const WriteOptions& options, WriteBatch* updates,
                      WriteCallback* callback) {
-  // TODO batching the updates;
-  Status s;
-  WriteBatch small;
-  ValueBatch large;
-  s = DivideWriteBatch(updates, &small, &large);
+  Writer w(&write_mutex_);
+  w.options = options;
+  w.updates = updates;
+  w.callback = callback;
+  Status s = DivideWriteBatch(updates, &w.small, &w.large);
   if (!s.ok()) {
     return s;
   }
 
+  write_mutex_.Lock();
+  writers_.push_back(&w);
+  while (!w.done && &w != writers_.front()) {
+    w.cv.Wait();
+  }
+  if (w.done) {
+    write_mutex_.Unlock();
+    return w.status;
+  }
+
+  std::vector<Writer*> group(writers_.begin(), writers_.end());
+  write_mutex_.Unlock();
+
+  WriteOptions group_options = group.front()->options;
+  std::vector<ValueBatch*> batches;
+  batches.reserve(group.size());
+  for (Writer* writer : group) {
+    group_options.sync = group_options.sync || writer->options.sync;
+    batches.push_back(&writer->large);
+  }
+
   {
     WriteLock l(&rwlock_);
-    s = vlog_->Write(options, &large);
+    s = vlog_->Write(group_options, batches);
   }
+
   if (s.ok()) {
-    large.ToWriteBatch(&small);
-    s = db_->Write(options, &small, callback);
+    for (Writer* writer : group) {
+      s = writer->large.ToWriteBatch(&writer->small);
+      if (!s.ok()) {
+        writer->status = s;
+        continue;
+      }
+      writer->status =
+          db_->Write(writer->options, &writer->small, writer->callback);
+    }
+  } else {
+    for (Writer* writer : group) {
+      writer->status = s;
+    }
   }
-  return s;
+
+  write_mutex_.Lock();
+  for (Writer* writer : group) {
+    assert(writers_.front() == writer);
+    writers_.pop_front();
+    writer->done = true;
+    writer->cv.Signal();
+  }
+  if (!writers_.empty()) {
+    writers_.front()->cv.Signal();
+  }
+  write_mutex_.Unlock();
+  return w.status;
 }
 
 Status BlobDB::DivideWriteBatch(WriteBatch* input, WriteBatch* small,

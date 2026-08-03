@@ -90,9 +90,9 @@ class VLogRWFile {
     builder_->Flush();
   }
 
-  void Sync() {
+  Status Sync() {
     assert(!closed_);
-    file_->Sync();
+    return file_->Sync();
   }
 
   void Finish() {
@@ -118,6 +118,7 @@ class VLogRWFile {
   uint32_t Offset() const { return builder_->Offset(); }
   uint32_t FileSize() const { return builder_->FileSize(); }
   uint64_t FileNumber() const { return number_; }
+  Status status() const { return builder_->status(); }
 
  private:
   ~VLogRWFile() {
@@ -167,6 +168,8 @@ class ValueLogImpl {
              ValueHandle* handle);
 
   Status Write(const WriteOptions& options, ValueBatch* batch);
+  Status Write(const WriteOptions& options,
+               const std::vector<ValueBatch*>& batches);
 
   Status Get(const ReadOptions& options, const ValueHandle& handle,
              std::string* value);

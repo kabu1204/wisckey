@@ -34,6 +34,7 @@ class ValueBatch {
   ValueBatch& operator=(const ValueBatch&) = default;
 
   void Put(const Slice& key, const Slice& value);
+  void PutBorrowed(const Slice& key, const Slice& value);
 
   Status ToWriteBatch(WriteBatch* batch);
 
@@ -45,7 +46,7 @@ class ValueBatch {
 
   const char* data() const { return rep_.data(); }
 
-  size_t size() const { return rep_.size(); }
+  size_t size() const { return borrowed_ ? borrowed_size_ : rep_.size(); }
 
   static char* EncodeKey(char* ptr, const Slice& key);
 
@@ -58,6 +59,11 @@ class ValueBatch {
   static bool GetVLogRecord(Slice* input, Slice* key, Slice* value);
 
  private:
+  struct BorrowedRecord {
+    Slice key;
+    Slice value;
+  };
+
   friend class VLogBuilder;
   friend class ValueLogImpl;
 
@@ -71,7 +77,10 @@ class ValueBatch {
   }
 
   bool closed;
+  bool borrowed_ = false;
   std::string rep_;
+  size_t borrowed_size_ = 0;
+  std::vector<BorrowedRecord> borrowed_records_;
   uint32_t num_entries;
   std::vector<ValueHandle> handles_;
 };

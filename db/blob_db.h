@@ -5,6 +5,7 @@
 #define LEVELDB_BLOB_DB_H
 
 #include "db/db_impl.h"
+#include <deque>
 #include <utility>
 #include <vector>
 
@@ -72,6 +73,8 @@ class BlobDB : public DB {
   Status VLogBGError();
 
  private:
+  struct Writer;
+
   friend class DB;
   friend class ValueLogImpl;
 
@@ -88,6 +91,8 @@ class BlobDB : public DB {
   std::string dbname_;
 
   port::RWMutex rwlock_;
+  port::Mutex write_mutex_;
+  std::deque<Writer*> writers_;
   DBImpl* const db_;
   ValueLogImpl* const vlog_;
 };

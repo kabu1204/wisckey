@@ -43,17 +43,36 @@ Status ValueLogImpl::Put(const WriteOptions& options, const Slice& key,
 }
 
 Status ValueLogImpl::Write(const WriteOptions& options, ValueBatch* batch) {
-  Status s;
-  batch->Finalize(rwfile_->FileNumber(), rwfile_->Offset());
-  rwfile_->Write(batch);
-  if (options.sync) {
-    rwfile_->Sync();
+  std::vector<ValueBatch*> batches = {batch};
+  return Write(options, batches);
+}
+
+Status ValueLogImpl::Write(const WriteOptions& options,
+                           const std::vector<ValueBatch*>& batches) {
+  WriteLock l(&rwlock_);
+  for (ValueBatch* batch : batches) {
+    if (rwfile_->Offset() != 0 &&
+        rwfile_->Offset() + batch->size() > options_.blob_max_file_size) {
+      Status s = FinishBuild();
+      if (!s.ok()) return s;
+    }
+
+    batch->Finalize(rwfile_->FileNumber(), rwfile_->Offset());
+    rwfile_->Write(batch);
+    if (!rwfile_->status().ok()) {
+      return rwfile_->status();
+    }
+
+    if (rwfile_->FileSize() > options_.blob_max_file_size) {
+      Status s = FinishBuild();
+      if (!s.ok()) return s;
+    }
   }
-  if (rwfile_->FileSize() > options_.blob_max_file_size) {
-    WriteLock l(&rwlock_);
-    s = FinishBuild();
+
+  if (options.sync && rwfile_ != nullptr) {
+    return rwfile_->Sync();
   }
-  return s;
+  return Status::OK();
 }
 
 Status ValueLogImpl::Get(const ReadOptions& options, const ValueHandle& handle,
