@@ -360,7 +360,7 @@ Status ValueLogImpl::Rewrite(GarbageCollection* gc) {
     WriteLock l(&rwlock_);
     number = NewFileNumber();
     s = env_->NewAppendableRandomAccessFile(VLogFileName(dbname_, number),
-                                            &file);
+                                            &file, options_.blob_max_file_size);
     if (!s.ok()) {
       return s;
     }

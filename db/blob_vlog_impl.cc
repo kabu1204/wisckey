@@ -43,17 +43,36 @@ Status ValueLogImpl::Put(const WriteOptions& options, const Slice& key,
 }
 
 Status ValueLogImpl::Write(const WriteOptions& options, ValueBatch* batch) {
-  Status s;
-  batch->Finalize(rwfile_->FileNumber(), rwfile_->Offset());
-  rwfile_->Write(batch);
-  if (options.sync) {
-    rwfile_->Sync();
+  std::vector<ValueBatch*> batches = {batch};
+  return Write(options, batches);
+}
+
+Status ValueLogImpl::Write(const WriteOptions& options,
+                           const std::vector<ValueBatch*>& batches) {
+  WriteLock l(&rwlock_);
+  for (ValueBatch* batch : batches) {
+    if (rwfile_->Offset() != 0 &&
+        rwfile_->Offset() + batch->size() > options_.blob_max_file_size) {
+      Status s = FinishBuild();
+      if (!s.ok()) return s;
+    }
+
+    batch->Finalize(rwfile_->FileNumber(), rwfile_->Offset());
+    rwfile_->Write(batch);
+    if (!rwfile_->status().ok()) {
+      return rwfile_->status();
+    }
+
+    if (rwfile_->FileSize() > options_.blob_max_file_size) {
+      Status s = FinishBuild();
+      if (!s.ok()) return s;
+    }
   }
-  if (rwfile_->FileSize() > options_.blob_max_file_size) {
-    WriteLock l(&rwlock_);
-    s = FinishBuild();
+
+  if (options.sync && rwfile_ != nullptr) {
+    return rwfile_->Sync();
   }
-  return s;
+  return Status::OK();
 }
 
 Status ValueLogImpl::Get(const ReadOptions& options, const ValueHandle& handle,
@@ -69,7 +88,7 @@ Status ValueLogImpl::Get(const ReadOptions& options, const ValueHandle& handle,
   Status s = GetLocked(options, rwfile, handle, value);
 
   if (rwfile) rwfile->Unref();
-  return Status::OK();
+  return s;
 }
 
 /*
@@ -78,7 +97,7 @@ Status ValueLogImpl::Get(const ReadOptions& options, const ValueHandle& handle,
 Status ValueLogImpl::GetLocked(const ReadOptions& options, VLogRWFile* rwfile,
                                const ValueHandle& handle, std::string* value) {
   rwlock_.AssertRLockHeld();
-  Iterator* iter;
+  Cache::Handle* cache_handle = nullptr;
 
   if (!rwfile || handle.table_ != rwfile->FileNumber()) {
     /*
@@ -89,8 +108,11 @@ Status ValueLogImpl::GetLocked(const ReadOptions& options, VLogRWFile* rwfile,
       if (handle.offset_ >= it->second.file_size) {
         return Status::InvalidArgument("value log offset is out of limit");
       }
-      iter = vlog_cache_->NewIterator(options, handle.table_,
-                                      it->second.file_size);
+      Status s = vlog_cache_->FindReader(handle.table_, it->second.file_size,
+                                          &cache_handle);
+      if (!s.ok()) {
+        return s;
+      }
     } else {
       return Status::NotFound("value log number not exists");
     }
@@ -103,29 +125,20 @@ Status ValueLogImpl::GetLocked(const ReadOptions& options, VLogRWFile* rwfile,
           handle.offset_, rwfile->Offset());
       return Status::InvalidArgument("value log offset is out of limit");
     }
-    iter = rwfile->NewIterator(options);
   }
 
-  {
-    // unlock when reading from disk
-    rwlock_.RUnlock();
-    std::string handle_encoding;
-    handle.EncodeTo(&handle_encoding);
-    iter->Seek(handle_encoding);  // expensive
-    if (iter->Valid()) {
-      const Slice v = iter->value();
-      value->assign(v.data(), v.size());
-    } else {
-      Status s = Status::NotFound("value not found", iter->status().ToString());
-      delete iter;
-      rwlock_.RLock();
-      return s;
-    }
-    delete iter;
-    rwlock_.RLock();
+  // Pin the cache entry while holding rwlock_, then unlock during IO.
+  rwlock_.RUnlock();
+  Status s;
+  if (cache_handle != nullptr) {
+    s = vlog_cache_->Get(options, cache_handle, handle.offset_, handle.size_,
+                         value);
+    vlog_cache_->Release(cache_handle);
+  } else {
+    s = rwfile->Get(options, handle.offset_, handle.size_, value);
   }
-
-  return Status::OK();
+  rwlock_.RLock();
+  return s;
 }
 
 /*
@@ -326,7 +339,8 @@ Status ValueLogImpl::Recover() {
     LogAndApply(&edit);
   } else {
     s = env_->NewAppendableRandomAccessFile(
-        VLogFileName(dbname_, latest_rw_file), &file);
+        VLogFileName(dbname_, latest_rw_file), &file,
+        options_.blob_max_file_size);
     assert(s.ok());
     rwfile_ = new VLogRWFile(options_, file, latest_rw_file, true, offset,
                              num_entries);
@@ -443,7 +457,8 @@ Status ValueLogImpl::LogAndApply(BlobVersionEdit* edit) {
   if (edit->has_new_rw_file_) {
     AppendableRandomAccessFile* file;
     s = env_->NewAppendableRandomAccessFile(
-        VLogFileName(dbname_, edit->new_rw_file_), &file);
+        VLogFileName(dbname_, edit->new_rw_file_), &file,
+        options_.blob_max_file_size);
     rwfile_ = new VLogRWFile(options_, file, edit->new_rw_file_);
     rwfile_->Ref();
   }
@@ -689,7 +704,8 @@ Status ValueLogImpl::ValidateAndTruncate(uint64_t number, uint64_t* offset,
   VLogReader* reader;
 
   s = env_->GetFileSize(filename, file_size);
-  s = env_->NewAppendableRandomAccessFile(filename, &file);
+  s = env_->NewAppendableRandomAccessFile(filename, &file,
+                                          options_.blob_max_file_size);
   assert(s.ok());
   s = VLogReader::Open(options_, file, *file_size, &reader);
   if (!s.ok()) {

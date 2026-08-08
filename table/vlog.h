@@ -64,6 +64,9 @@ class VLogReader {
 
   VLogReaderIterator* NewIterator(const ReadOptions&) const;
 
+  Status Get(const ReadOptions&, uint32_t offset, uint32_t size,
+             std::string* value) const;
+
   /*
    * Iterate through the file, stop when !iter->Valid(),
    * storing the validated size and num_entries of the file in the arguments.

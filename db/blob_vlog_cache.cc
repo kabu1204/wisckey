@@ -76,6 +76,17 @@ Status VLogCache::Get(const ReadOptions& options, uint64_t file_number,
   return s;
 }
 
+Status VLogCache::Get(const ReadOptions& options, Cache::Handle* handle,
+                      uint32_t offset, uint32_t size, std::string* value) {
+  VLogReader* reader =
+      reinterpret_cast<TableAndFile*>(cache_->Value(handle))->table;
+  return reader->Get(options, offset, size, value);
+}
+
+void VLogCache::Release(Cache::Handle* handle) {
+  cache_->Release(handle);
+}
+
 void VLogCache::Evict(uint64_t file_number) {
     char buf[sizeof(file_number)];
     EncodeFixed64(buf, file_number);

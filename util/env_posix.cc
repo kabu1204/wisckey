@@ -77,6 +77,33 @@ uint64_t AlignBackward(uint64_t x, uint64_t p){
   return x;
 }
 
+int PreallocateFile(int fd, size_t size) {
+#if defined(__APPLE__)
+  struct stat file_stat;
+  if (fstat(fd, &file_stat) == 0 && file_stat.st_size < size) {
+    fstore_t store;
+    std::memset(&store, 0, sizeof(store));
+    store.fst_flags = F_ALLOCATECONTIGUOUS;
+    store.fst_posmode = F_PEOFPOSMODE;
+    store.fst_length = static_cast<off_t>(size - file_stat.st_size);
+    if (fcntl(fd, F_PREALLOCATE, &store) == -1) {
+      store.fst_flags = F_ALLOCATEALL;
+      fcntl(fd, F_PREALLOCATE, &store);
+    }
+  }
+  if (ftruncate(fd, size) < 0) {
+    return errno;
+  }
+  return 0;
+#else
+  if (ftruncate(fd, size) < 0) {
+    return errno;
+  }
+  (void)posix_fallocate(fd, 0, size);
+  return 0;
+#endif
+}
+
 // Helper class to limit resource usage to avoid exhaustion.
 // Currently used to limit read-only file descriptors and mmap file usage
 // so that we do not run out of file descriptors or virtual memory, or run into
@@ -481,7 +508,7 @@ class PosixMmapAppendableFile final: public AppendableRandomAccessFile {
   // REQUIRES: reserved > file_size
   // REQUIRES: O_TRUNC enabled when open fd
   PosixMmapAppendableFile(std::string filename, size_t file_size, size_t reserved,
-                          int fd)
+                          int fd, bool preallocate)
       : filename_(std::move(filename)),
         len_(file_size),
         cap_(0),
@@ -501,9 +528,25 @@ class PosixMmapAppendableFile final: public AppendableRandomAccessFile {
       return;
     }
 
-    assert(reserved_ > file_size);
     assert(!(reserved_ & (page_size_ - 1)));
-    ExtendMmapSize(file_size);
+    if (preallocate) {
+      if (PreallocateFile(fd_, reserved_) != 0) {
+        status_ = Status::IOError("failed to size file");
+        return;
+      }
+      char* addr = (char*)::mmap(mmap_base_, reserved_,
+                                 PROT_READ | PROT_WRITE,
+                                 MAP_SHARED | MAP_FIXED, fd_, 0);
+      if (addr == MAP_FAILED || addr != mmap_base_) {
+        status_ = Status::IOError("failed to mmap preallocated file");
+        return;
+      }
+      cap_ = reserved_;
+      madvise(mmap_base_, reserved_, MADV_SEQUENTIAL);
+    } else {
+      assert(reserved_ > file_size);
+      ExtendMmapSize(file_size);
+    }
     //    printf("[LOG] init: len_=%lu, cap_=%lu, reserved_=%lu\n", len_.load(),
     //    cap_,
     //           reserved_);
@@ -764,7 +807,8 @@ class PosixEnv : public Env {
   }
 
   Status NewAppendableRandomAccessFile(const std::string& filename,
-                                       AppendableRandomAccessFile** result) override {
+                                       AppendableRandomAccessFile** result,
+                                       uint64_t preallocate_size = 0) override {
     int fd = ::open(filename.c_str(),
                     O_APPEND | O_RDWR | O_CREAT | kOpenBaseFlags, 0644);
     if (fd < 0) {
@@ -774,8 +818,10 @@ class PosixEnv : public Env {
     uint64_t file_size;
     Status status = GetFileSize(filename, &file_size);
     if(status.ok()){
-      uint64_t reserved = std::max<uint64_t>(file_size<<1, 8 << 20);
-      *result = new PosixMmapAppendableFile(filename, file_size, reserved, fd);
+      uint64_t reserved = std::max<uint64_t>(
+          file_size << 1, std::max<uint64_t>(preallocate_size, 8 << 20));
+      *result = new PosixMmapAppendableFile(
+          filename, file_size, reserved, fd, preallocate_size != 0);
     }
     return Status::OK();
   }

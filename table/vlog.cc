@@ -76,6 +76,13 @@ void VLogBuilder::Add(const Slice& key, const Slice& value, ValueHandle* handle)
 }
 
 void VLogBuilder::AddBatch(const ValueBatch* batch) {
+  if (batch->borrowed_) {
+    for (const auto& record : batch->borrowed_records_) {
+      Add(record.key, record.value, nullptr);
+      if (!ok()) return;
+    }
+    return;
+  }
   rep_->status = rep_->file->Append(Slice(batch->data(), batch->size()));
   if (!ok()) return;
 
@@ -155,6 +162,40 @@ VLogReader::~VLogReader() {
   delete rep_;
 }
 
+Status VLogReader::Get(const ReadOptions& options, uint32_t offset,
+                       uint32_t size, std::string* value) const {
+  if (offset >= rep_->limit || size > rep_->limit - offset) {
+    return Status::InvalidArgument("value log offset is out of limit");
+  }
+
+  char stack_scratch[512];
+  thread_local std::string reusable_scratch;
+  char* scratch = stack_scratch;
+  if (size > sizeof(stack_scratch)) {
+    if (reusable_scratch.size() < size) {
+      reusable_scratch.resize(size);
+    }
+    scratch = &reusable_scratch[0];
+  }
+
+  Slice result;
+  Status s = rep_->file->Read(offset, size, &result, scratch);
+  if (!s.ok()) {
+    return s;
+  }
+
+  uint32_t key_len;
+  uint32_t value_len;
+  const char* p =
+      DecodeEntry(result.data(), result.data() + result.size(), &key_len,
+                  &value_len);
+  if (p == nullptr) {
+    return Status::Corruption("corrupted vlog entry");
+  }
+  value->assign(p + key_len, value_len);
+  return Status::OK();
+}
+
 bool VLogReaderIterator::ParseCurrentEntry(uint32_t size) {
   if (current_ >= limit_) return false;
   Slice result;
@@ -172,6 +213,10 @@ bool VLogReaderIterator::ParseCurrentEntry(uint32_t size) {
                     &val_len);
     if (p == nullptr) {
       status_ = Status::Corruption("corrupted vlog entry");
+      return false;
+    }
+    if (key_len == 0) {
+      status_ = Status::OK();
       return false;
     }
 
@@ -341,12 +386,25 @@ bool ValueBatch::GetVLogRecord(Slice* input, Slice* key, Slice* value) {
 // should be called after SetSequence()
 void ValueBatch::Put(const Slice& key, const Slice& value) {
   assert(!closed);
+  assert(!borrowed_);
   uint32_t off = rep_.size();
   PutVarint32(&rep_, key.size());
   PutVarint32(&rep_, value.size());
   ValueBatch::PutKey(&rep_, key);
   rep_.append(value.data(), value.size());
   handles_.emplace_back(0, 0, off, rep_.size() - off);
+  num_entries++;
+}
+
+void ValueBatch::PutBorrowed(const Slice& key, const Slice& value) {
+  assert(!closed);
+  assert(rep_.empty());
+  borrowed_ = true;
+  uint32_t off = borrowed_size_;
+  borrowed_size_ += VarintLength(key.size()) + VarintLength(value.size()) +
+                    key.size() + value.size();
+  borrowed_records_.push_back({key, value});
+  handles_.emplace_back(0, 0, off, borrowed_size_ - off);
   num_entries++;
 }
 
@@ -366,6 +424,16 @@ class ToWriteBatchHandler : public ValueBatch::Handler {
 Status ValueBatch::ToWriteBatch(WriteBatch* batch) {
   assert(closed);
   assert(num_entries == handles_.size());
+  if (borrowed_) {
+    std::string handle_encoding;
+    for (size_t i = 0; i < borrowed_records_.size(); ++i) {
+      handle_encoding.clear();
+      handles_[i].EncodeTo(&handle_encoding);
+      WriteBatchInternal::Put(batch, borrowed_records_[i].key,
+                              handle_encoding, kTypeValueHandle);
+    }
+    return Status::OK();
+  }
   ToWriteBatchHandler handler;
   handler.batch = batch;
 
