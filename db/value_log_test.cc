@@ -7,6 +7,9 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
+#include <deque>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -2030,6 +2033,120 @@ TEST(DBIMPL_TEST, SyncWaitsForActiveLogAppend) {
   CleanDir(options.env, dbname);
 }
 
+TEST(DBIMPL_TEST, OrdinaryWriterWaitsForOrderedLogAppend) {
+  BlockingLogEnv env(Env::Default());
+  Options options;
+  options.env = &env;
+  options.create_if_missing = true;
+  const std::string dbname("testdb-dbimpl-ordered-write-barrier");
+  CleanDir(options.env, dbname);
+
+  DB* db = nullptr;
+  ASSERT_TRUE(DB::Open(options, dbname, &db).ok());
+  ASSERT_NE(nullptr, db);
+  DBImpl* db_impl = static_cast<DBImpl*>(db);
+
+  WriteBatch ordered_batch;
+  ordered_batch.Put("ordered", "first");
+  DBImpl::WriteState ordered_state = DBImpl::WriteState::kNotWritten;
+  Status ordered_status;
+  Status ordinary_status;
+  std::atomic<bool> ordinary_done{false};
+
+  env.BlockNextLogAppend();
+  std::thread ordered_writer([&] {
+    ordered_status = db_impl->WriteOrderedWithOutcome(
+        WriteOptions(), &ordered_batch, nullptr, &ordered_state);
+  });
+  env.WaitForBlockedLogAppend();
+
+  std::thread ordinary_writer([&] {
+    ordinary_status = db->Put(WriteOptions(), "ordinary", "second");
+    ordinary_done.store(true, std::memory_order_release);
+  });
+  WaitForWriterQueueSize(db_impl, 1);
+  EXPECT_FALSE(ordinary_done.load(std::memory_order_acquire));
+
+  env.ReleaseLogAppend();
+  ordered_writer.join();
+  ordinary_writer.join();
+
+  EXPECT_TRUE(ordered_status.ok()) << ordered_status.ToString();
+  EXPECT_EQ(DBImpl::WriteState::kApplied, ordered_state);
+  EXPECT_TRUE(ordinary_status.ok()) << ordinary_status.ToString();
+  EXPECT_EQ(2U, db_impl->LatestSequence());
+
+  std::string value;
+  ASSERT_TRUE(db->Get(ReadOptions(), "ordered", &value).ok());
+  EXPECT_EQ("first", value);
+  ASSERT_TRUE(db->Get(ReadOptions(), "ordinary", &value).ok());
+  EXPECT_EQ("second", value);
+
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(DBIMPL_TEST, OrderedWriterWaitsForOrdinaryLogAppend) {
+  BlockingLogEnv env(Env::Default());
+  Options options;
+  options.env = &env;
+  options.create_if_missing = true;
+  const std::string dbname("testdb-dbimpl-ordinary-write-barrier");
+  CleanDir(options.env, dbname);
+
+  DB* db = nullptr;
+  ASSERT_TRUE(DB::Open(options, dbname, &db).ok());
+  ASSERT_NE(nullptr, db);
+  DBImpl* db_impl = static_cast<DBImpl*>(db);
+
+  Status ordinary_status;
+  env.BlockNextLogAppend();
+  std::thread ordinary_writer([&] {
+    ordinary_status = db->Put(WriteOptions(), "ordinary", "first");
+  });
+  env.WaitForBlockedLogAppend();
+
+  WriteBatch ordered_batch;
+  ordered_batch.Put("ordered", "second");
+  DBImpl::WriteState ordered_state = DBImpl::WriteState::kNotWritten;
+  Status ordered_status;
+  std::atomic<bool> ordered_started{false};
+  std::atomic<bool> ordered_done{false};
+  std::thread ordered_writer([&] {
+    ordered_started.store(true, std::memory_order_release);
+    ordered_status = db_impl->WriteOrderedWithOutcome(
+        WriteOptions(), &ordered_batch, nullptr, &ordered_state);
+    ordered_done.store(true, std::memory_order_release);
+  });
+  while (!ordered_started.load(std::memory_order_acquire)) {
+    options.env->SleepForMicroseconds(100);
+  }
+  while (!db_impl->TEST_OrderedWriteWaiting() &&
+         !ordered_done.load(std::memory_order_acquire)) {
+    options.env->SleepForMicroseconds(100);
+  }
+  EXPECT_TRUE(db_impl->TEST_OrderedWriteWaiting());
+  EXPECT_FALSE(ordered_done.load(std::memory_order_acquire));
+
+  env.ReleaseLogAppend();
+  ordinary_writer.join();
+  ordered_writer.join();
+
+  EXPECT_TRUE(ordinary_status.ok()) << ordinary_status.ToString();
+  EXPECT_TRUE(ordered_status.ok()) << ordered_status.ToString();
+  EXPECT_EQ(DBImpl::WriteState::kApplied, ordered_state);
+  EXPECT_EQ(2U, db_impl->LatestSequence());
+
+  std::string value;
+  ASSERT_TRUE(db->Get(ReadOptions(), "ordinary", &value).ok());
+  EXPECT_EQ("first", value);
+  ASSERT_TRUE(db->Get(ReadOptions(), "ordered", &value).ok());
+  EXPECT_EQ("second", value);
+
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
 TEST(DBIMPL_TEST, SyncDoesNotRotateUnsyncedWAL) {
   BlockingLogEnv env(Env::Default());
   Options options;
@@ -2235,6 +2352,10 @@ TEST(VLOG_TEST, IndeterminateLSMAppendKeepsPublicationPin) {
   env.FailLogAppendAfterSuccessOnCall(2);
   Status s = db->Put(WriteOptions(), "key", std::string(1100, 'v'));
   ASSERT_TRUE(s.IsIOError()) << s.ToString();
+  Status later = db->Put(WriteOptions(), "later", std::string(1100, 'x'));
+  EXPECT_TRUE(later.IsIOError()) << later.ToString();
+  std::string unpublished;
+  EXPECT_TRUE(db->Get(ReadOptions(), "later", &unpublished).IsNotFound());
 
   const std::string source = VLogFileName(dbname, 3);
   ASSERT_TRUE(options.env->FileExists(source));
@@ -2281,6 +2402,15 @@ TEST(VLOG_TEST, CallbackIOErrorReleasesUnpublishedVLogPin) {
   Status s = db->Write(WriteOptions(), &batch, &callback);
   ASSERT_TRUE(s.IsIOError()) << s.ToString();
 
+  // Callback rejection is local and occurs before WAL emission. It must not
+  // poison the ordered publication queue for an independent later request.
+  ASSERT_TRUE(
+      db->Put(WriteOptions(), "after-rejection", std::string(1100, 'a')).ok());
+  std::string after_rejection;
+  ASSERT_TRUE(
+      db->Get(ReadOptions(), "after-rejection", &after_rejection).ok());
+  EXPECT_EQ(std::string(1100, 'a'), after_rejection);
+
   const std::string unpublished_vlog = VLogFileName(dbname, 3);
   ASSERT_TRUE(options.env->FileExists(unpublished_vlog));
   db->ManualGC(3);
@@ -2309,6 +2439,8 @@ TEST(VLOG_TEST, NonIOWALFailureKeepsPublicationPin) {
   env.FailLogAppendAfterSuccessWithInvalidArgumentOnCall(2);
   Status s = db->Put(WriteOptions(), "key", std::string(1100, 'v'));
   ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  Status later = db->Put(WriteOptions(), "later", std::string(1100, 'x'));
+  EXPECT_TRUE(later.IsInvalidArgument()) << later.ToString();
 
   const std::string source = VLogFileName(dbname, 3);
   ASSERT_TRUE(options.env->FileExists(source));
@@ -3000,6 +3132,155 @@ TEST(VLOG_TEST, ConcurrentSPMC) {
 
 namespace {
 
+class QueuedScheduleEnv : public EnvWrapper {
+ public:
+  explicit QueuedScheduleEnv(Env* target) : EnvWrapper(target) {}
+
+  void Schedule(void (*function)(void*), void* arg) override {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      jobs_.push_back(Job(function, arg));
+    }
+    cv_.notify_all();
+  }
+
+  bool WaitForJob(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout, [this] { return !jobs_.empty(); });
+  }
+
+  bool RunNext() {
+    Job job;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (jobs_.empty()) return false;
+      job = jobs_.front();
+      jobs_.pop_front();
+    }
+    job.function(job.arg);
+    return true;
+  }
+
+ private:
+  struct Job {
+    Job() : function(nullptr), arg(nullptr) {}
+    Job(void (*scheduled_function)(void*), void* scheduled_arg)
+        : function(scheduled_function), arg(scheduled_arg) {}
+
+    void (*function)(void*);
+    void* arg;
+  };
+
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<Job> jobs_;
+};
+
+class ObservedMemoryVLogFile : public AppendableRandomAccessFile {
+ public:
+  Status Read(uint64_t offset, size_t n, Slice* result,
+              char* scratch) const override {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (offset > contents_.size() || n > contents_.size() - offset) {
+      *result = Slice();
+      return Status::InvalidArgument("memory vlog read past end");
+    }
+    std::memcpy(scratch, contents_.data() + offset, n);
+    *result = Slice(scratch, n);
+    return Status::OK();
+  }
+
+  Status Append(const Slice& data) override {
+    const Slice part(data);
+    return WriteAtV(Offset(), &part, 1);
+  }
+
+  Status AppendV(const Slice* parts, size_t count) override {
+    return WriteAtV(Offset(), parts, count);
+  }
+
+  Status WriteAtV(uint64_t offset, const Slice* parts,
+                  size_t count) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (closed_) return Status::IOError("memory vlog is closed");
+    if (parts == nullptr && count != 0) {
+      return Status::InvalidArgument("null memory vlog write vector");
+    }
+    uint64_t end = offset;
+    for (size_t i = 0; i < count; ++i) {
+      if (parts[i].size() > std::numeric_limits<uint64_t>::max() - end) {
+        return Status::InvalidArgument("memory vlog is too large");
+      }
+      end += parts[i].size();
+    }
+    if (end > std::numeric_limits<size_t>::max()) {
+      return Status::InvalidArgument("memory vlog is too large");
+    }
+    if (contents_.size() < end) contents_.resize(static_cast<size_t>(end));
+    size_t destination = static_cast<size_t>(offset);
+    for (size_t i = 0; i < count; ++i) {
+      if (!parts[i].empty()) {
+        std::memcpy(&contents_[destination], parts[i].data(), parts[i].size());
+      }
+      destination += parts[i].size();
+    }
+    return Status::OK();
+  }
+
+  Status Truncate(uint64_t size) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (size > std::numeric_limits<size_t>::max()) {
+      return Status::InvalidArgument("memory vlog is too large");
+    }
+    contents_.resize(static_cast<size_t>(size));
+    return Status::OK();
+  }
+
+  Status Close() override {
+    std::lock_guard<std::mutex> lock(mu_);
+    closed_ = true;
+    return Status::OK();
+  }
+
+  Status Flush() override { return Status::OK(); }
+
+  Status Sync() override {
+    bool fail;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      ++sync_calls_;
+      fail = fail_sync_;
+    }
+    cv_.notify_all();
+    return fail ? Status::IOError("injected background vlog sync error")
+                : Status::OK();
+  }
+
+  uint64_t Offset() override {
+    std::lock_guard<std::mutex> lock(mu_);
+    return contents_.size();
+  }
+
+  void FailSync() {
+    std::lock_guard<std::mutex> lock(mu_);
+    fail_sync_ = true;
+  }
+
+  bool WaitForSyncCalls(int expected, std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout,
+                        [this, expected] { return sync_calls_ >= expected; });
+  }
+
+ private:
+  mutable std::mutex mu_;
+  std::condition_variable cv_;
+  std::string contents_;
+  int sync_calls_{0};
+  bool fail_sync_{false};
+  bool closed_{false};
+};
+
 class BlockingAppendVLogEnv : public EnvWrapper {
  public:
   explicit BlockingAppendVLogEnv(Env* target) : EnvWrapper(target) {}
@@ -3062,6 +3343,23 @@ class BlockingAppendVLogEnv : public EnvWrapper {
       }
       return target_->AppendV(parts, count);
     }
+    Status WriteAtV(uint64_t offset, const Slice* parts,
+                    size_t count) override {
+      {
+        std::unique_lock<std::mutex> lock(env_->mu_);
+        if (env_->block_next_) {
+          env_->block_next_ = false;
+          env_->blocked_ = true;
+          env_->cv_.notify_all();
+          env_->cv_.wait(lock, [this] { return env_->release_; });
+          env_->blocked_ = false;
+        }
+      }
+      return target_->WriteAtV(offset, parts, count);
+    }
+    Status Truncate(uint64_t size) override {
+      return target_->Truncate(size);
+    }
     Status Close() override { return target_->Close(); }
     Status Flush() override { return target_->Flush(); }
     Status Sync() override { return target_->Sync(); }
@@ -3109,6 +3407,18 @@ class ErrorInjectingVLogFile : public AppendableRandomAccessFile {
     return target_->AppendV(parts, count);
   }
 
+  Status WriteAtV(uint64_t offset, const Slice* parts,
+                  size_t count) override {
+    if (fail_append_->load(std::memory_order_acquire)) {
+      return Status::IOError("injected vlog append error");
+    }
+    return target_->WriteAtV(offset, parts, count);
+  }
+
+  Status Truncate(uint64_t size) override {
+    return target_->Truncate(size);
+  }
+
   Status Close() override { return target_->Close(); }
   Status Flush() override { return target_->Flush(); }
 
@@ -3148,7 +3458,316 @@ class ErrorInjectingVLogEnv : public EnvWrapper {
   std::atomic<bool> fail_sync{false};
 };
 
+// Blocks the first positioned write, partially writes and fails the second,
+// and lets any later positioned writes complete. This makes out-of-order
+// completion and the failed-range boundary deterministic.
+class OrderedFailureVLogEnv : public EnvWrapper {
+ public:
+  explicit OrderedFailureVLogEnv(Env* target) : EnvWrapper(target) {}
+
+  Status NewAppendableRandomAccessFile(
+      const std::string& filename,
+      AppendableRandomAccessFile** result) override {
+    AppendableRandomAccessFile* target_file = nullptr;
+    Status s = target()->NewAppendableRandomAccessFile(filename, &target_file);
+    if (!s.ok()) {
+      *result = nullptr;
+      return s;
+    }
+    *result = new File(this, target_file);
+    return Status::OK();
+  }
+
+  bool WaitForFirstWrite(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout, [this] { return first_blocked_; });
+  }
+
+  bool WaitForFailedWrite(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout, [this] { return failed_write_done_; });
+  }
+
+  bool WaitForSecondWrite(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout, [this] { return second_waiting_; });
+  }
+
+  void ReleaseFirstWrite() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      release_first_ = true;
+      // Also make failure-path cleanup unable to strand the deliberately
+      // delayed second call if the test never manages to start call three.
+      third_write_started_ = true;
+    }
+    cv_.notify_all();
+  }
+
+  int max_active_writes() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return max_active_writes_;
+  }
+
+ private:
+  class File : public AppendableRandomAccessFile {
+   public:
+    File(OrderedFailureVLogEnv* env, AppendableRandomAccessFile* target)
+        : env_(env), target_(target) {}
+    ~File() override { delete target_; }
+
+    Status Read(uint64_t offset, size_t n, Slice* result,
+                char* scratch) const override {
+      return target_->Read(offset, n, result, scratch);
+    }
+    Status Append(const Slice& data) override { return target_->Append(data); }
+    Status AppendV(const Slice* parts, size_t count) override {
+      return target_->AppendV(parts, count);
+    }
+
+    Status WriteAtV(uint64_t offset, const Slice* parts,
+                    size_t count) override {
+      bool fail = false;
+      {
+        std::unique_lock<std::mutex> lock(env_->mu_);
+        const size_t write_index = env_->next_write_++;
+        ++env_->active_writes_;
+        env_->max_active_writes_ =
+            std::max(env_->max_active_writes_, env_->active_writes_);
+        if (write_index == 0) {
+          env_->first_blocked_ = true;
+          env_->cv_.notify_all();
+          env_->cv_.wait(lock, [this] { return env_->release_first_; });
+        } else if (write_index == 1) {
+          fail = true;
+          env_->second_waiting_ = true;
+          env_->cv_.notify_all();
+          env_->cv_.wait(lock, [this] { return env_->third_write_started_; });
+        } else if (write_index == 2) {
+          env_->third_write_started_ = true;
+          env_->cv_.notify_all();
+        }
+      }
+
+      Status s;
+      if (fail) {
+        // Model pwritev's documented partial-write failure. Leave one byte of
+        // the failed record on disk so orderly close/recovery must repair it.
+        size_t part = 0;
+        while (part < count && parts[part].empty()) ++part;
+        if (part < count) {
+          Slice prefix(parts[part].data(), 1);
+          s = target_->WriteAtV(offset, &prefix, 1);
+        }
+        if (s.ok()) s = Status::IOError("injected middle vlog write failure");
+      } else {
+        s = target_->WriteAtV(offset, parts, count);
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(env_->mu_);
+        if (fail) env_->failed_write_done_ = true;
+        --env_->active_writes_;
+      }
+      env_->cv_.notify_all();
+      return s;
+    }
+
+    Status Truncate(uint64_t size) override {
+      return target_->Truncate(size);
+    }
+    Status Close() override { return target_->Close(); }
+    Status Flush() override { return target_->Flush(); }
+    Status Sync() override { return target_->Sync(); }
+    uint64_t Offset() override { return target_->Offset(); }
+
+   private:
+    OrderedFailureVLogEnv* const env_;
+    AppendableRandomAccessFile* const target_;
+  };
+
+  std::mutex mu_;
+  std::condition_variable cv_;
+  size_t next_write_{0};
+  bool first_blocked_{false};
+  bool release_first_{false};
+  bool second_waiting_{false};
+  bool third_write_started_{false};
+  bool failed_write_done_{false};
+  int active_writes_{0};
+  int max_active_writes_{0};
+};
+
 }  // namespace
+
+TEST(VLOG_TEST, FinishWaitsForQueuedBackgroundSync) {
+  QueuedScheduleEnv env(Env::Default());
+  Options options;
+  options.env = &env;
+  options.blob_max_file_size = 64ULL << 20;
+
+  auto* memory_file = new ObservedMemoryVLogFile;
+  VLogRWFile* file = new VLogRWFile(options, memory_file, 3);
+  file->Ref();
+  ASSERT_TRUE(file->status().ok()) << file->status().ToString();
+
+  ValueBatch batch;
+  batch.Put("key", std::string(16 << 20, 'v'));
+  uint32_t offset = 0;
+  ASSERT_TRUE(file->Reserve(batch.size(), batch.NumEntries(), &offset).ok());
+  ASSERT_TRUE(file->Write(offset, &batch).ok());
+  ASSERT_TRUE(env.WaitForJob(std::chrono::seconds(5)));
+
+  Status finish_status;
+  std::atomic<bool> finish_done{false};
+  std::thread finisher([&] {
+    finish_status = file->Finish();
+    finish_done.store(true, std::memory_order_release);
+  });
+  const bool finish_sync_started =
+      memory_file->WaitForSyncCalls(1, std::chrono::seconds(5));
+  const bool waited_for_background =
+      !finish_done.load(std::memory_order_acquire);
+  const bool ran_background = env.RunNext();
+  finisher.join();
+
+  EXPECT_TRUE(finish_sync_started);
+  EXPECT_TRUE(waited_for_background);
+  EXPECT_TRUE(ran_background);
+  EXPECT_TRUE(finish_status.ok()) << finish_status.ToString();
+  EXPECT_TRUE(finish_done.load(std::memory_order_acquire));
+
+  file->Unref();
+}
+
+TEST(VLOG_TEST, BackgroundSyncFailureIsTerminal) {
+  QueuedScheduleEnv env(Env::Default());
+  Options options;
+  options.env = &env;
+  options.blob_max_file_size = 64ULL << 20;
+
+  auto* memory_file = new ObservedMemoryVLogFile;
+  VLogRWFile* file = new VLogRWFile(options, memory_file, 3);
+  file->Ref();
+  ASSERT_TRUE(file->status().ok()) << file->status().ToString();
+
+  ValueBatch batch;
+  batch.Put("key", std::string(16 << 20, 'v'));
+  uint32_t offset = 0;
+  ASSERT_TRUE(file->Reserve(batch.size(), batch.NumEntries(), &offset).ok());
+  ASSERT_TRUE(file->Write(offset, &batch).ok());
+  ASSERT_TRUE(env.WaitForJob(std::chrono::seconds(5)));
+
+  memory_file->FailSync();
+  ASSERT_TRUE(env.RunNext());
+  EXPECT_TRUE(file->status().IsIOError()) << file->status().ToString();
+  Status finish_status = file->Finish();
+  EXPECT_TRUE(finish_status.IsIOError()) << finish_status.ToString();
+
+  file->Unref();
+}
+
+TEST(VLOG_TEST, ParallelWritesPublishOnlyContiguousSuccessfulPrefix) {
+  OrderedFailureVLogEnv env(Env::Default());
+  Options options;
+  options.env = &env;
+  options.create_if_missing = true;
+  options.blob_value_size_threshold = 1;
+  options.blob_max_file_size = 1 << 20;
+  options.blob_gc_interval = 0;
+  options.blob_background_read_threads = 0;
+  const std::string dbname("testdb-parallel-vlog-failure-boundary");
+  CleanDir(options.env, dbname);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  ASSERT_NE(nullptr, db);
+
+  const std::string first_value(4096, 'a');
+  const std::string failed_value(4096, 'b');
+  const std::string later_value(4096, 'c');
+  Status first_status;
+  Status failed_status;
+  Status later_status;
+  WriteOptions sync;
+  sync.sync = true;
+
+  std::thread first([&] {
+    first_status = db->Put(sync, "first", first_value);
+  });
+  if (!env.WaitForFirstWrite(std::chrono::seconds(5))) {
+    env.ReleaseFirstWrite();
+    first.join();
+    ADD_FAILURE() << "first positioned write did not block";
+    delete db;
+    CleanDir(options.env, dbname);
+    return;
+  }
+
+  std::thread failed([&] {
+    failed_status = db->Put(WriteOptions(), "failed", failed_value);
+  });
+  if (!env.WaitForSecondWrite(std::chrono::seconds(5))) {
+    env.ReleaseFirstWrite();
+    first.join();
+    failed.join();
+    ADD_FAILURE() << "second positioned write did not overlap the first";
+    delete db;
+    CleanDir(options.env, dbname);
+    return;
+  }
+
+  // The injected second call waits for this later reservation to enter
+  // WriteAtV. It then leaves a one-byte partial record and fails while this
+  // later disjoint range is allowed to finish first.
+  std::thread later([&] {
+    later_status = db->Put(WriteOptions(), "later", later_value);
+  });
+  const bool failed_out_of_order =
+      env.WaitForFailedWrite(std::chrono::seconds(5));
+  env.ReleaseFirstWrite();
+  first.join();
+  failed.join();
+  later.join();
+
+  ASSERT_TRUE(failed_out_of_order)
+      << "middle positioned write did not fail before the first completed";
+  EXPECT_GE(env.max_active_writes(), 3);
+  EXPECT_TRUE(first_status.ok()) << first_status.ToString();
+  EXPECT_TRUE(failed_status.IsIOError()) << failed_status.ToString();
+  EXPECT_TRUE(later_status.IsIOError()) << later_status.ToString();
+
+  std::string value;
+  ASSERT_TRUE(db->Get(ReadOptions(), "first", &value).ok());
+  EXPECT_EQ(first_value, value);
+  EXPECT_TRUE(db->Get(ReadOptions(), "failed", &value).IsNotFound());
+  EXPECT_TRUE(db->Get(ReadOptions(), "later", &value).IsNotFound());
+
+  std::string pipeline;
+  ASSERT_TRUE(db->GetProperty("leveldb.blobdb.write-pipeline", &pipeline));
+  EXPECT_NE(std::string::npos, pipeline.find("requests=3")) << pipeline;
+  EXPECT_NE(std::string::npos, pipeline.find("max_vlog_inflight=3"))
+      << pipeline;
+  EXPECT_NE(std::string::npos, pipeline.find("vlog_syncs=1")) << pipeline;
+
+  delete db;
+  db = nullptr;
+
+  // Finish() must remove both the partial failed range and the successfully
+  // completed but unpublishable later tail before recovery scans the file.
+  uint64_t file_size = 0;
+  ASSERT_TRUE(options.env->GetFileSize(VLogFileName(dbname, 3), &file_size).ok());
+  EXPECT_EQ(SizeOf("first", first_value), file_size);
+
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  ASSERT_TRUE(db->Get(ReadOptions(), "first", &value).ok());
+  EXPECT_EQ(first_value, value);
+  EXPECT_TRUE(db->Get(ReadOptions(), "failed", &value).IsNotFound());
+  EXPECT_TRUE(db->Get(ReadOptions(), "later", &value).IsNotFound());
+
+  delete db;
+  CleanDir(options.env, dbname);
+}
 
 TEST(VLOG_TEST, BlockedAppendDoesNotBlockReadOnlyVLogGet) {
   BlockingAppendVLogEnv env(Env::Default());
@@ -3241,6 +3860,9 @@ TEST(VLOG_TEST, WriteErrorsDoNotPublishHandles) {
   env.fail_append.store(true, std::memory_order_release);
   Status s = db->Put(WriteOptions(), "append-failed", "orphan");
   ASSERT_TRUE(s.IsIOError()) << s.ToString();
+  env.fail_append.store(false, std::memory_order_release);
+  Status later = db->Put(WriteOptions(), "after-append-failure", "orphan");
+  EXPECT_TRUE(later.IsIOError()) << later.ToString();
 
   std::string value;
   ASSERT_TRUE(db->Get(ReadOptions(), "append-failed", &value).IsNotFound());
@@ -3249,16 +3871,17 @@ TEST(VLOG_TEST, WriteErrorsDoNotPublishHandles) {
   delete db;
   CleanDir(options.env, dbname);
 
-  env.fail_append.store(false, std::memory_order_release);
   ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
   WriteOptions sync_options;
   sync_options.sync = true;
   env.fail_sync.store(true, std::memory_order_release);
   s = db->Put(sync_options, "sync-failed", "orphan");
   ASSERT_TRUE(s.IsIOError()) << s.ToString();
+  env.fail_sync.store(false, std::memory_order_release);
+  later = db->Put(WriteOptions(), "after-sync-failure", "orphan");
+  EXPECT_TRUE(later.IsIOError()) << later.ToString();
   ASSERT_TRUE(db->Get(ReadOptions(), "sync-failed", &value).IsNotFound());
   delete db;
-  env.fail_sync.store(false, std::memory_order_release);
   CleanDir(options.env, dbname);
 }
 

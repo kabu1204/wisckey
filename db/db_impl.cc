@@ -1165,6 +1165,11 @@ size_t DBImpl::TEST_WriterQueueSize() {
   return writers_.size();
 }
 
+bool DBImpl::TEST_OrderedWriteWaiting() {
+  MutexLock l(&mutex_);
+  return ordered_write_waiters_ != 0;
+}
+
 void DBImpl::TEST_BuildWriterGroup() {
   MutexLock l(&mutex_);
   assert(writers_.empty());
@@ -1508,8 +1513,12 @@ Status DBImpl::Sync() {
   w.sync = true;
 
   MutexLock l(&mutex_);
+  while (ordered_write_waiters_ != 0) {
+    background_work_finished_signal_.Wait();
+  }
   writers_.push_back(&w);
-  while (!w.done && &w != writers_.front()) {
+  while (!w.done &&
+         (ordered_write_active_ || &w != writers_.front())) {
     w.cv.Wait();
   }
   if (w.done) {
@@ -1538,6 +1547,8 @@ Status DBImpl::Sync() {
   writers_.pop_front();
   if (!writers_.empty()) {
     writers_.front()->cv.Signal();
+  } else {
+    background_work_finished_signal_.SignalAll();
   }
   return status;
 }
@@ -1567,8 +1578,12 @@ Status DBImpl::WriteWithOutcome(const WriteOptions& options,
   w.callback = callback;
 
   MutexLock l(&mutex_);
+  while (ordered_write_waiters_ != 0) {
+    background_work_finished_signal_.Wait();
+  }
   writers_.push_back(&w);
-  while (!w.done && &w != writers_.front()) {
+  while (!w.done &&
+         (ordered_write_active_ || &w != writers_.front())) {
     w.cv.Wait();
   }
   if (w.done) {
@@ -1634,6 +1649,9 @@ Status DBImpl::WriteWithOutcome(const WriteOptions& options,
         if (cur_leader->callback != nullptr) {
           leader_status = cur_leader->callback->Callback(this);
           callback_rejected = !leader_status.ok();
+          if (callback_rejected) {
+            leader_state = WriteState::kCallbackRejected;
+          }
         }
 
         bool sync_error = false;
@@ -1710,12 +1728,84 @@ Status DBImpl::WriteWithOutcome(const WriteOptions& options,
   // Notify new head of write queue
   if (!writers_.empty()) {
     writers_.front()->cv.Signal();
+  } else {
+    background_work_finished_signal_.SignalAll();
   }
 
   if (write_state != nullptr) {
     *write_state = first_writer_state;
   }
   return first_writer_status;
+}
+
+Status DBImpl::WriteOrderedWithOutcome(const WriteOptions& options,
+                                       WriteBatch* updates,
+                                       WriteCallback* callback,
+                                       WriteState* write_state) {
+  if (write_state != nullptr) *write_state = WriteState::kNotWritten;
+  if (updates == nullptr) {
+    return Status::InvalidArgument("null ordered write batch");
+  }
+
+  MutexLock lock(&mutex_);
+  // BlobDB routes its writes through one publication coordinator, but public
+  // maintenance operations such as CompactRange() can still install an
+  // internal force-flush writer. Wait for that queue to drain before taking
+  // the ordered slot. Writers arriving afterward observe
+  // ordered_write_active_ and wait behind this publication.
+  ++ordered_write_waiters_;
+  while (ordered_write_active_ || !writers_.empty()) {
+    background_work_finished_signal_.Wait();
+  }
+  assert(ordered_write_waiters_ > 0);
+  --ordered_write_waiters_;
+  ordered_write_active_ = true;
+
+  Status status = MakeRoomForWrite(false);
+  while (status.ok() && options.sync && imm_ != nullptr) {
+    background_work_finished_signal_.Wait();
+    status = bg_error_;
+  }
+
+  WriteState state = WriteState::kNotWritten;
+  bool sequence_assigned = false;
+  bool sync_error = false;
+  uint64_t last_sequence = versions_->LastSequence();
+  if (status.ok()) {
+    mutex_.Unlock();
+
+    if (callback != nullptr) {
+      status = callback->Callback(this);
+      if (!status.ok()) state = WriteState::kCallbackRejected;
+    }
+
+    if (status.ok()) {
+      WriteBatchInternal::SetSequence(updates, last_sequence + 1);
+      last_sequence += WriteBatchInternal::Count(updates);
+      sequence_assigned = true;
+      // From WAL emission onward, errors are indeterminate until recovery.
+      state = WriteState::kMayBeWritten;
+      status = log_->AddRecord(WriteBatchInternal::Contents(updates));
+      if (status.ok() && options.sync) {
+        status = logfile_->Sync();
+        sync_error = !status.ok();
+      }
+      if (status.ok()) {
+        status = WriteBatchInternal::InsertInto(updates, mem_);
+      }
+      if (status.ok()) state = WriteState::kApplied;
+    }
+
+    mutex_.Lock();
+  }
+
+  if (sync_error) RecordBackgroundError(status);
+  if (sequence_assigned) versions_->SetLastSequence(last_sequence);
+  ordered_write_active_ = false;
+  if (!writers_.empty()) writers_.front()->cv.Signal();
+  background_work_finished_signal_.SignalAll();
+  if (write_state != nullptr) *write_state = state;
+  return status;
 }
 
 // REQUIRES: Writer list must be non-empty
@@ -1785,7 +1875,8 @@ void DBImpl::BuildWriterGroup(WriterGroup* group) {
 }
 
 // REQUIRES: mutex_ is held
-// REQUIRES: this thread is currently at the front of the writer queue
+// REQUIRES: this thread is currently at the front of the writer queue, or is
+// the sole ordered writer installed by BlobDB's publication coordinator.
 // MakeRoomForWrite do:
 //  1. sleep to faster the BG compaction or
 //  2. wait for the BG compaction or
@@ -1794,7 +1885,7 @@ void DBImpl::BuildWriterGroup(WriterGroup* group) {
 // @param force: force compaction
 Status DBImpl::MakeRoomForWrite(bool force) {
   mutex_.AssertHeld();
-  assert(!writers_.empty());
+  assert(!writers_.empty() || ordered_write_active_);
   bool allow_delay = !force;
   Status s;
   while (true) {

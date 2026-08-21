@@ -344,6 +344,17 @@ class LEVELDB_EXPORT AppendableRandomAccessFile : public RandomAccessFile,
     return Status::OK();
   }
 
+  // Write multiple non-contiguous slices at the specified offset without
+  // changing any implicit append position. Calls for disjoint ranges must be
+  // safe to run concurrently with each other, Read(), and Sync(). A failed
+  // call may have modified a prefix of the requested range.
+  virtual Status WriteAtV(uint64_t offset, const Slice* parts,
+                          size_t count) = 0;
+
+  // Change the logical and physical size of the open file. The caller must
+  // ensure that no WriteAtV() call is in flight.
+  virtual Status Truncate(uint64_t size) = 0;
+
 };
 
 // An interface for writing log messages.

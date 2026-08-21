@@ -10,6 +10,8 @@
 #ifndef STORAGE_LEVELDB_PORT_PORT_EXAMPLE_H_
 #define STORAGE_LEVELDB_PORT_PORT_EXAMPLE_H_
 
+#include <cstdint>
+
 #include "port/thread_annotations.h"
 
 namespace leveldb {

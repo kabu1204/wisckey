@@ -42,7 +42,10 @@ class ValueBatch {
 
   Status ToWriteBatch(WriteBatch* batch);
 
-  const std::vector<ValueHandle>& Handles() const { return handles_; }
+  const ValueHandle& Handle(size_t index) const {
+    assert(index < num_entries);
+    return borrowed_inline_ ? inline_borrowed_handle_ : handles_[index];
+  }
 
   Status Iterate(Handler* handler);
 
@@ -69,21 +72,35 @@ class ValueBatch {
   };
 
   friend class VLogBuilder;
+  friend class VLogRWFile;
   friend class ValueLogImpl;
 
   void Finalize(uint32_t table, uint32_t offset) {
     assert(!closed);
     closed = true;
-    for (auto& handle : handles_) {
+    if (borrowed_inline_) {
+      inline_borrowed_handle_.table_ = table;
+      inline_borrowed_handle_.offset_ += offset;
+    }
+    for (ValueHandle& handle : handles_) {
       handle.table_ = table;
       handle.offset_ += offset;
     }
   }
 
+  const BorrowedRecord& BorrowedRecordAt(size_t index) const {
+    assert(borrowed_ && index < num_entries);
+    return borrowed_inline_ ? inline_borrowed_record_
+                            : borrowed_records_[index];
+  }
+
   bool closed;
   bool borrowed_{false};
+  bool borrowed_inline_{false};
   std::string rep_;
   size_t borrowed_size_{0};
+  BorrowedRecord inline_borrowed_record_;
+  ValueHandle inline_borrowed_handle_;
   std::vector<BorrowedRecord> borrowed_records_;
   uint32_t num_entries;
   std::vector<ValueHandle> handles_;

@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -371,6 +372,30 @@ TEST_F(EnvPosixTest, AppendableRandomAccessSyncAndGrowth) {
   ASSERT_LEVELDB_OK(file->AppendV(vector_parts.data(), vector_parts.size()));
   ASSERT_LEVELDB_OK(file->Sync());
 
+  const std::string positioned_first = "positioned-first";
+  const std::string positioned_second = "positioned-second";
+  const uint64_t positioned_offset = file->Offset();
+  Status first_status;
+  Status second_status;
+  std::thread first_writer([&] {
+    Slice parts[] = {Slice(positioned_first.data(), 5),
+                     Slice(positioned_first.data() + 5,
+                           positioned_first.size() - 5)};
+    first_status = file->WriteAtV(positioned_offset, parts, 2);
+  });
+  std::thread second_writer([&] {
+    Slice parts[] = {Slice(positioned_second.data(), 7),
+                     Slice(positioned_second.data() + 7,
+                           positioned_second.size() - 7)};
+    second_status = file->WriteAtV(
+        positioned_offset + positioned_first.size(), parts, 2);
+  });
+  first_writer.join();
+  second_writer.join();
+  ASSERT_LEVELDB_OK(first_status);
+  ASSERT_LEVELDB_OK(second_status);
+  ASSERT_LEVELDB_OK(file->Sync());
+
   char scratch[32];
   Slice result;
   ASSERT_LEVELDB_OK(file->Read(large_offset + large_record.size() - 32,
@@ -380,15 +405,24 @@ TEST_F(EnvPosixTest, AppendableRandomAccessSyncAndGrowth) {
   ASSERT_LEVELDB_OK(file->Read(vector_offset, vector_expected.size(), &result,
                                &vector_scratch[0]));
   ASSERT_EQ(vector_expected, result.ToString());
-  ASSERT_EQ(expected.size() + large_record.size() + vector_expected.size(),
-            file->Offset());
+  const std::string positioned_expected =
+      positioned_first + positioned_second;
+  std::string positioned_scratch(positioned_expected.size(), '\0');
+  ASSERT_LEVELDB_OK(file->Read(positioned_offset, positioned_expected.size(),
+                               &result, &positioned_scratch[0]));
+  ASSERT_EQ(positioned_expected, result.ToString());
+  const uint64_t expected_size = expected.size() + large_record.size() +
+                                 vector_expected.size() +
+                                 positioned_expected.size();
+  ASSERT_EQ(expected_size, file->Offset());
+  ASSERT_LEVELDB_OK(file->Truncate(expected_size - 3));
+  ASSERT_EQ(expected_size - 3, file->Offset());
   ASSERT_LEVELDB_OK(file->Close());
   delete file;
 
   uint64_t file_size = 0;
   ASSERT_LEVELDB_OK(env_->GetFileSize(file_path, &file_size));
-  ASSERT_EQ(expected.size() + large_record.size() + vector_expected.size(),
-            file_size);
+  ASSERT_EQ(expected_size - 3, file_size);
   ASSERT_LEVELDB_OK(env_->RemoveFile(file_path));
 }
 

@@ -100,11 +100,25 @@ void VLogBuilder::AddBatch(const ValueBatch* batch) {
     return;
   }
   if (batch->borrowed_) {
+    if (batch->NumEntries() == 1) {
+      const auto& record = batch->BorrowedRecordAt(0);
+      std::string header;
+      PutVarint32(&header, record.key.size());
+      PutVarint32(&header, record.value.size());
+      const Slice parts[] = {Slice(header), record.key, record.value};
+      rep_->status = rep_->file->AppendV(parts, 3);
+      if (!ok()) return;
+      rep_->offset.store(offset + static_cast<uint32_t>(batch->size()),
+                         std::memory_order_release);
+      ++rep_->num_entries;
+      return;
+    }
     std::vector<std::string> headers;
     std::vector<Slice> parts;
-    headers.reserve(batch->borrowed_records_.size());
-    parts.reserve(batch->borrowed_records_.size() * 3);
-    for (const auto& record : batch->borrowed_records_) {
+    headers.reserve(batch->NumEntries());
+    parts.reserve(batch->NumEntries() * 3);
+    for (size_t i = 0; i < batch->NumEntries(); ++i) {
+      const auto& record = batch->BorrowedRecordAt(i);
       headers.emplace_back();
       PutVarint32(&headers.back(), record.key.size());
       PutVarint32(&headers.back(), record.value.size());
@@ -531,9 +545,23 @@ void ValueBatch::PutBorrowed(const Slice& key, const Slice& value) {
   borrowed_size_ += VarintLength(key.size()) + VarintLength(value.size()) +
                     key.size() + value.size();
   assert(borrowed_size_ <= std::numeric_limits<uint32_t>::max());
-  borrowed_records_.push_back({key, value});
-  handles_.emplace_back(0, 0, off,
-                        static_cast<uint32_t>(borrowed_size_) - off);
+  const ValueHandle handle(0, 0, off,
+                           static_cast<uint32_t>(borrowed_size_) - off);
+  if (num_entries == 0) {
+    inline_borrowed_record_ = {key, value};
+    inline_borrowed_handle_ = handle;
+    borrowed_inline_ = true;
+  } else {
+    if (borrowed_inline_) {
+      borrowed_records_.reserve(2);
+      handles_.reserve(2);
+      borrowed_records_.push_back(inline_borrowed_record_);
+      handles_.push_back(inline_borrowed_handle_);
+      borrowed_inline_ = false;
+    }
+    borrowed_records_.push_back({key, value});
+    handles_.push_back(handle);
+  }
   num_entries++;
 }
 
@@ -552,13 +580,14 @@ class ToWriteBatchHandler : public ValueBatch::Handler {
 
 Status ValueBatch::ToWriteBatch(WriteBatch* batch) {
   assert(closed);
-  assert(num_entries == handles_.size());
+  assert((borrowed_inline_ && num_entries == 1) ||
+         num_entries == handles_.size());
   if (borrowed_) {
     std::string handle_encoding;
-    for (size_t i = 0; i < borrowed_records_.size(); ++i) {
+    for (size_t i = 0; i < num_entries; ++i) {
       handle_encoding.clear();
-      handles_[i].EncodeTo(&handle_encoding);
-      WriteBatchInternal::Put(batch, borrowed_records_[i].key,
+      Handle(i).EncodeTo(&handle_encoding);
+      WriteBatchInternal::Put(batch, BorrowedRecordAt(i).key,
                               handle_encoding, kTypeValueHandle);
     }
     return Status::OK();
@@ -570,11 +599,12 @@ Status ValueBatch::ToWriteBatch(WriteBatch* batch) {
 }
 
 Status ValueBatch::Iterate(ValueBatch::Handler* handler) {
-  assert(num_entries == handles_.size());
+  assert((borrowed_inline_ && num_entries == 1) ||
+         num_entries == handles_.size());
   if (borrowed_) {
-    for (size_t i = 0; i < borrowed_records_.size(); ++i) {
-      if (!(*handler)(borrowed_records_[i].key, borrowed_records_[i].value,
-                      handles_[i])) {
+    for (size_t i = 0; i < num_entries; ++i) {
+      const BorrowedRecord& record = BorrowedRecordAt(i);
+      if (!(*handler)(record.key, record.value, Handle(i))) {
         break;
       }
     }

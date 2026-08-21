@@ -33,96 +33,26 @@ class VLogRWFile {
  public:
   VLogRWFile(const Options& options, AppendableRandomAccessFile* f,
              uint64_t number, bool reuse = false, uint32_t offset = 0,
-             uint32_t num_entries = 0)
-      : file_(f),
-        builder_(nullptr),
-        reader_(nullptr),
-        closed_(false),
-        file_closed_(false),
-        number_(number),
-        refs_(0) {
-    if (file_ == nullptr) {
-      status_ = Status::InvalidArgument("null writable value log file");
-    } else {
-      builder_ = new VLogBuilder(options, file_, reuse, offset, num_entries);
-      status_ = VLogReader::Open(options, file_, offset, &reader_);
-    }
-  }
+             uint32_t num_entries = 0);
 
   VLogRWFile(const VLogRWFile&) = delete;
   VLogRWFile& operator=(const VLogRWFile&) = delete;
 
-  void Ref() { refs_.fetch_add(1, std::memory_order_relaxed); }
-  void Unref() {
-    // The decrement and last-reference decision must be one atomic operation.
-    // Separate `--refs_` and `refs_ == 0` operations let two readers both
-    // observe zero and delete the same file wrapper.
-    const int previous = refs_.fetch_sub(1, std::memory_order_acq_rel);
-    assert(previous > 0);
-    if (previous == 1) {
-      delete this;
-    }
-  }
+  void Ref();
+  void Unref();
 
-  Status Write(const ValueBatch* batch) {
-    if (closed_) {
-      return status_.ok() ? Status::IOError("value log file is closed")
-                          : status_;
-    }
-    if (!status_.ok()) return status_;
-    builder_->AddBatch(batch);
-    SaveError(builder_->status());
-    if (!status_.ok()) return status_;
-    reader_->IncreaseOffset(builder_->Offset());
-    return Status::OK();
-  }
+  // Reserve a non-overlapping range. Reservation is serialized, while the
+  // corresponding Write() calls may run concurrently.
+  Status Reserve(size_t bytes, uint32_t num_entries, uint32_t* offset);
+  Status Write(uint32_t offset, const ValueBatch* batch);
 
-  // should be called after Ref()
-  Status Add(const Slice& key, const Slice& val, ValueHandle* handle) {
-    if (closed_) {
-      return status_.ok() ? Status::IOError("value log file is closed")
-                          : status_;
-    }
-    if (!status_.ok()) return status_;
-    builder_->Add(key, val, handle);
-    SaveError(builder_->status());
-    if (!status_.ok()) return status_;
-    reader_->IncreaseOffset(builder_->Offset());
-    return Status::OK();
-  }
+  // Make all successfully completed bytes through end durable. Later
+  // disjoint writes are allowed to continue while the sync is in progress.
+  Status SyncThrough(uint32_t end);
 
-  Status Flush() {
-    if (closed_) return status_;
-    builder_->Flush();
-    SaveError(builder_->status());
-    return status_;
-  }
-
-  Status Sync() {
-    if (closed_) return status_;
-    if (!status_.ok()) return status_;
-    SaveError(file_->Sync());
-    return status_;
-  }
-
-  Status Finish() {
-    if (closed_) return status_;
-    if (builder_ != nullptr) SaveError(builder_->Finish());
-    if (file_ != nullptr) {
-      SaveError(file_->Sync());
-      // Published files are finished with both their metadata-owner reference
-      // and an operation reference held. That forces physical Close() to the
-      // destructor, after every reader reference is gone. The <= 1 case is
-      // only for unpublished construction-error cleanup, where no reader can
-      // acquire a reference.
-      if (refs_.load(std::memory_order_acquire) <= 1) {
-        SaveError(file_->Close());
-        file_closed_ = true;
-      }
-    }
-    closed_ = true;
-    return status_;
-  }
+  // Stop reservations, drain in-flight writes, repair a failed tail, and sync
+  // the complete prefix.
+  Status Finish();
 
   Iterator* NewIterator(const ReadOptions& options) {
     Ref();
@@ -133,50 +63,65 @@ class VLogRWFile {
 
   Status Get(const ReadOptions& options, uint32_t offset, uint32_t size,
              std::string* value) {
-    if (reader_ == nullptr) return status_;
+    if (reader_ == nullptr) return status();
     return reader_->Get(options, offset, size, value);
   }
 
-  Status status() const { return status_; }
+  Status status();
 
-  uint32_t Offset() const { return builder_->Offset(); }
-  uint32_t FileSize() const { return builder_->FileSize(); }
+  uint32_t Offset();
+  uint32_t FileSize();
+  uint32_t ReadableSize();
   uint64_t FileNumber() const { return number_; }
 
  private:
-  ~VLogRWFile() {
-    assert(closed_);
-    delete reader_;
-    delete builder_;
-    if (file_ != nullptr && !file_closed_) {
-      (void)file_->Close();
-      file_closed_ = true;
-    }
-    delete file_;
-  }
+  struct PendingWrite {
+    uint32_t offset = 0;
+    uint32_t end = 0;
+    uint32_t num_entries = 0;
+    bool done = false;
+    Status status;
+  };
+
+  ~VLogRWFile();
 
   static void UnrefCleanup(void* arg1, void* arg2) {
     VLogRWFile* p = reinterpret_cast<VLogRWFile*>(arg1);
     p->Unref();
   }
 
-  void SaveError(const Status& status) {
-    if (status_.ok() && !status.ok()) {
-      status_ = status;
-    }
-  }
+  void SaveError(const Status& status);
+  Status ResultStatus() EXCLUSIVE_LOCKS_REQUIRED(state_mutex_);
+  void CompleteWrite(uint32_t offset, const Status& status);
+  void MaybeScheduleBackgroundSync();
+  static void BackgroundSync(void* arg);
 
   std::atomic<int> refs_;
-  bool closed_;
+  port::Mutex state_mutex_;
+  port::CondVar state_cv_ GUARDED_BY(state_mutex_);
+  port::Mutex sync_mutex_;
+  bool sealed_ GUARDED_BY(state_mutex_);
+  bool closed_ GUARDED_BY(state_mutex_);
   bool file_closed_;
+  uint32_t reserved_end_ GUARDED_BY(state_mutex_);
+  uint32_t readable_end_ GUARDED_BY(state_mutex_);
+  uint32_t durable_end_ GUARDED_BY(state_mutex_);
+  uint32_t num_entries_ GUARDED_BY(state_mutex_);
+  size_t in_flight_ GUARDED_BY(state_mutex_);
+  std::vector<PendingWrite> pending_writes_ GUARDED_BY(state_mutex_);
+  uint32_t failed_offset_ GUARDED_BY(state_mutex_);
+  Status write_failure_ GUARDED_BY(state_mutex_);
+  // File-wide failures (open, sync, truncate, or close) invalidate every
+  // range. Positioned-write failures are tracked separately above so an
+  // earlier contiguous prefix can still be synced and published.
+  Status status_ GUARDED_BY(state_mutex_);
+  const uint64_t number_;
+  Env* const env_;
+  const uint32_t background_sync_step_;
+  bool background_sync_active_ GUARDED_BY(state_mutex_) = false;
 
-  Status status_;
-  uint64_t number_;
-
-  AppendableRandomAccessFile* const
-      file_;              // the file that currently being built
-  VLogBuilder* builder_;  // associated with rw_file_
-  VLogReader* reader_;    // associated with rw_file_
+  AppendableRandomAccessFile* const file_;
+  VLogReader* reader_;
 };
 
 class ValueLogGCWriteCallback;
@@ -187,6 +132,14 @@ struct GarbageCollection;
  */
 class ValueLogImpl {
  public:
+  struct WriteReservation {
+    VLogRWFile* file = nullptr;
+    uint64_t file_number = 0;
+    uint32_t offset = 0;
+    uint32_t end = 0;
+    bool publication_pinned = false;
+  };
+
   static Status Open(const Options& options, const std::string& dbname, DB* db,
                      ValueLogImpl** vlog);
 
@@ -204,9 +157,18 @@ class ValueLogImpl {
   Status Write(const WriteOptions& options, ValueBatch* batch,
                uint64_t* publication_token = nullptr);
 
+  // Reserve in admission order, write outside the reservation mutex, then
+  // release the operation reference after LSM publication is resolved.
+  Status ReserveWrite(ValueBatch* batch, bool pin_publication,
+                      WriteReservation* reservation);
+  Status WriteReserved(const WriteReservation& reservation,
+                       const ValueBatch* batch);
+  void ReleaseReservation(WriteReservation* reservation,
+                          bool release_publication);
+
   // Releases a file pin returned by Write after the corresponding LSM update
   // has either completed or failed.
-  void ReleasePublication(uint64_t publication_token);
+  void ReleasePublication(uint64_t publication_token, size_t count = 1);
 
   Status SyncVLog();
 
@@ -258,8 +220,10 @@ class ValueLogImpl {
       EXCLUSIVE_LOCKS_REQUIRED(append_mutex_);
 
   // Returns the current writable file with one caller-owned reference. The
-  // reference lets append/sync I/O proceed after the metadata lock is dropped.
-  VLogRWFile* RefCurrentFile();
+  // append mutex keeps the pointer stable while the reference is acquired.
+  VLogRWFile* RefCurrentFile() EXCLUSIVE_LOCKS_REQUIRED(append_mutex_);
+
+  bool HasPendingPublication(uint64_t number);
 
   Status NewVLogBuilder() EXCLUSIVE_LOCKS_REQUIRED(rwlock_);
 
@@ -292,6 +256,8 @@ class ValueLogImpl {
 
   void StopGCThread();
 
+  void StopBackgroundWork();
+
   void GCThread();
 
   void RecordBGError(Status&& s);
@@ -306,12 +272,12 @@ class ValueLogImpl {
   // this before rwlock_ when both are needed. Reads only need rwlock_ long
   // enough to pin metadata and therefore do not wait for append/fsync I/O.
   port::Mutex append_mutex_;
-  port::RWMutex rwlock_;      // protects class metadata
-  port::RWMutex commit_lock_;  // orders foreground publication and sync
+  port::RWMutex rwlock_;  // protects class metadata
   const std::string dbname_;
   Options options_;
   Env* const env_;
   DBImpl* const db_;              // LSM
+  BlobDB* owner_{nullptr};
   uint64_t vlog_file_number_{0};  // current maximum file number
   uint64_t manifest_number_{0};
   std::atomic<bool> shutdown_;
@@ -339,7 +305,11 @@ class ValueLogImpl {
   std::set<uint64_t> pending_outputs_ GUARDED_BY(rwlock_);
   std::map<uint64_t, SequenceNumber>
       obsolete_files_;  // <file_number, sequence>
-  std::map<uint64_t, size_t> pending_publications_ GUARDED_BY(rwlock_);
+  // Publication pins are touched once at admission and once after WAL
+  // resolution. Keep this hot counter off the broader metadata RW lock.
+  port::Mutex publication_mutex_;
+  std::map<uint64_t, size_t> pending_publications_
+      GUARDED_BY(publication_mutex_);
   std::set<uint64_t> deferred_gc_files_ GUARDED_BY(rwlock_);
   uint64_t gc_pointer_;
 

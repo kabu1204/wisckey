@@ -45,12 +45,26 @@ class DBImpl : public DB {
   Status Write(const WriteOptions& options, WriteBatch* updates,
                WriteCallback* callback) override;
 
-  // Describes whether a failed Write may nevertheless be present in the WAL.
-  // BlobDB uses this to retain value-log publication pins only when recovery
-  // could later expose the corresponding handle batch.
-  enum class WriteState { kNotWritten, kMayBeWritten, kApplied };
+  // Describes whether a Write was rejected before WAL emission, may
+  // nevertheless be present in the WAL, or was applied. BlobDB uses this to
+  // distinguish request-local callback rejection from terminal storage
+  // errors and to retain value-log publication pins only when recovery could
+  // later expose the corresponding handle batch.
+  enum class WriteState {
+    kNotWritten,
+    kCallbackRejected,
+    kMayBeWritten,
+    kApplied
+  };
   Status WriteWithOutcome(const WriteOptions& options, WriteBatch* updates,
                           WriteCallback* callback, WriteState* write_state);
+  // BlobDB's publication coordinator has already serialized this call and
+  // formed its WAL group. Bypass DBImpl's otherwise redundant writer queue.
+  // All external writes to this DBImpl must use the same coordinator.
+  Status WriteOrderedWithOutcome(const WriteOptions& options,
+                                 WriteBatch* updates,
+                                 WriteCallback* callback,
+                                 WriteState* write_state);
   Status Get(const ReadOptions& options, const Slice& key,
              std::string* value) override;
   Status Get(const ReadOptions& options, const Slice& key, std::string* value,
@@ -86,6 +100,7 @@ class DBImpl : public DB {
 
   // Return the number of writes waiting in the serialized writer queue.
   size_t TEST_WriterQueueSize();
+  bool TEST_OrderedWriteWaiting();
 
   // Record a sample of bytes read at the specified internal key.
   // Samples are taken approximately once every config::kReadBytesPeriod
@@ -207,6 +222,8 @@ class DBImpl : public DB {
 
   // Queue of writers.
   std::deque<Writer*> writers_ GUARDED_BY(mutex_);
+  bool ordered_write_active_ GUARDED_BY(mutex_) = false;
+  uint32_t ordered_write_waiters_ GUARDED_BY(mutex_) = 0;
   WriteBatch* tmp_batch_ GUARDED_BY(mutex_);
 
   SnapshotList snapshots_ GUARDED_BY(mutex_);

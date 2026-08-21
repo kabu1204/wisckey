@@ -147,6 +147,27 @@ class StringSinkSource: public AppendableRandomAccessFile {
     contents_.append(data.data(), data.size());
     return Status::OK();
   }
+  Status WriteAtV(uint64_t offset, const Slice* parts,
+                  size_t count) override {
+    size_t total = 0;
+    for (size_t i = 0; i < count; ++i) total += parts[i].size();
+    if (offset > contents_.size()) contents_.resize(offset, '\0');
+    if (total > contents_.size() - std::min<uint64_t>(offset, contents_.size()))
+      contents_.resize(offset + total);
+    size_t written = 0;
+    for (size_t i = 0; i < count; ++i) {
+      if (!parts[i].empty()) {
+        std::memcpy(&contents_[offset + written], parts[i].data(),
+                    parts[i].size());
+      }
+      written += parts[i].size();
+    }
+    return Status::OK();
+  }
+  Status Truncate(uint64_t size) override {
+    contents_.resize(size);
+    return Status::OK();
+  }
   uint64_t Size() const { return contents_.size(); }
   uint64_t Offset() override { return Size(); }
 

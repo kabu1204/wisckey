@@ -3,6 +3,9 @@
 
 #include "db/blob_vlog_impl.h"
 
+#include <algorithm>
+#include <limits>
+
 #include "db/filename.h"
 #include "db/log_reader.h"
 #include "db/log_writer.h"
@@ -12,6 +15,320 @@
 #include "util/mutexlock.h"
 
 namespace leveldb {
+
+VLogRWFile::VLogRWFile(const Options& options, AppendableRandomAccessFile* file,
+                       uint64_t number, bool reuse, uint32_t offset,
+                       uint32_t num_entries)
+    : refs_(0),
+      state_cv_(&state_mutex_),
+      sealed_(false),
+      closed_(false),
+      file_closed_(false),
+      reserved_end_(reuse ? offset : 0),
+      readable_end_(reuse ? offset : 0),
+      durable_end_(reuse ? offset : 0),
+      num_entries_(reuse ? num_entries : 0),
+      in_flight_(0),
+      failed_offset_(std::numeric_limits<uint32_t>::max()),
+      number_(number),
+      env_(options.env),
+      background_sync_step_(
+          options.blob_max_file_size < (64ULL << 20)
+              ? 0
+              : static_cast<uint32_t>(std::min<uint64_t>(
+                    options.blob_max_file_size / 4, 32ULL << 20))),
+      file_(file),
+      reader_(nullptr) {
+  if (file_ == nullptr) {
+    status_ = Status::InvalidArgument("null writable value log file");
+  } else {
+    status_ = VLogReader::Open(options, file_, readable_end_, &reader_);
+  }
+}
+
+VLogRWFile::~VLogRWFile() {
+  {
+    MutexLock lock(&state_mutex_);
+    assert(closed_);
+    assert(in_flight_ == 0);
+  }
+  delete reader_;
+  if (file_ != nullptr && !file_closed_) {
+    (void)file_->Close();
+    file_closed_ = true;
+  }
+  delete file_;
+}
+
+void VLogRWFile::Ref() {
+  refs_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void VLogRWFile::Unref() {
+  const int previous = refs_.fetch_sub(1, std::memory_order_acq_rel);
+  assert(previous > 0);
+  if (previous == 1) delete this;
+}
+
+void VLogRWFile::SaveError(const Status& status) {
+  state_mutex_.AssertHeld();
+  if (status_.ok() && !status.ok()) status_ = status;
+}
+
+Status VLogRWFile::ResultStatus() {
+  state_mutex_.AssertHeld();
+  return status_.ok() ? write_failure_ : status_;
+}
+
+Status VLogRWFile::Reserve(size_t bytes, uint32_t num_entries,
+                           uint32_t* offset) {
+  if (offset == nullptr) {
+    return Status::InvalidArgument("null value-log reservation offset");
+  }
+  MutexLock lock(&state_mutex_);
+  if (!status_.ok()) return status_;
+  if (!write_failure_.ok()) return write_failure_;
+  if (sealed_) return Status::IOError("value log file is sealed");
+  if (bytes > std::numeric_limits<uint32_t>::max() - reserved_end_) {
+    return Status::InvalidArgument("value log file is larger than 4 GiB");
+  }
+
+  *offset = reserved_end_;
+  PendingWrite pending;
+  pending.offset = *offset;
+  pending.end = reserved_end_ + static_cast<uint32_t>(bytes);
+  pending.num_entries = num_entries;
+  pending_writes_.push_back(pending);
+  reserved_end_ = pending.end;
+  ++in_flight_;
+  return Status::OK();
+}
+
+void VLogRWFile::CompleteWrite(uint32_t offset, const Status& status) {
+  MutexLock lock(&state_mutex_);
+  auto it = std::find_if(pending_writes_.begin(), pending_writes_.end(),
+                         [offset](const PendingWrite& pending) {
+                           return pending.offset == offset;
+                         });
+  assert(it != pending_writes_.end());
+  assert(!it->done);
+  it->done = true;
+  it->status = status;
+  assert(in_flight_ > 0);
+  --in_flight_;
+  if (!status.ok() &&
+      (write_failure_.ok() || offset < failed_offset_)) {
+    failed_offset_ = offset;
+    write_failure_ = status;
+  }
+
+  size_t completed_prefix = 0;
+  while (completed_prefix < pending_writes_.size()) {
+    const PendingWrite& first = pending_writes_[completed_prefix];
+    if (first.offset != readable_end_ || !first.done || !first.status.ok()) {
+      break;
+    }
+    readable_end_ = first.end;
+    num_entries_ += first.num_entries;
+    if (reader_ != nullptr) reader_->IncreaseOffset(readable_end_);
+    ++completed_prefix;
+  }
+  if (completed_prefix != 0) {
+    pending_writes_.erase(pending_writes_.begin(),
+                          pending_writes_.begin() + completed_prefix);
+  }
+  state_cv_.SignalAll();
+}
+
+void VLogRWFile::MaybeScheduleBackgroundSync() {
+  if (background_sync_step_ == 0 || env_ == nullptr) return;
+
+  {
+    MutexLock lock(&state_mutex_);
+    if (sealed_ || closed_ || !status_.ok() || !write_failure_.ok() ||
+        background_sync_active_ ||
+        readable_end_ - durable_end_ < background_sync_step_) {
+      return;
+    }
+    // Publish the task while holding the same mutex Finish() uses to seal the
+    // file. Otherwise Finish() can observe no active task in the gap between
+    // the eligibility check and task publication, then return while a newly
+    // queued callback still refers to the file and its caller-owned Env.
+    background_sync_active_ = true;
+    Ref();
+  }
+  env_->Schedule(&VLogRWFile::BackgroundSync, this);
+}
+
+void VLogRWFile::BackgroundSync(void* arg) {
+  VLogRWFile* file = static_cast<VLogRWFile*>(arg);
+  for (;;) {
+    const uint32_t target = file->ReadableSize();
+    (void)file->SyncThrough(target);
+
+    MutexLock lock(&file->state_mutex_);
+    // Keep ownership of the active slot until the callback has caught up.
+    // This avoids a clear/reschedule gap in which Finish() could close the
+    // file or let a caller-owned Env go out of scope before the successor was
+    // queued. Usually SyncThrough() also covers concurrent writes, so this
+    // loop executes only once.
+    if (!file->sealed_ && !file->closed_ && file->status_.ok() &&
+        file->write_failure_.ok() &&
+        file->readable_end_ - file->durable_end_ >=
+            file->background_sync_step_) {
+      continue;
+    }
+    file->background_sync_active_ = false;
+    file->state_cv_.SignalAll();
+    break;
+  }
+  file->Unref();
+}
+
+Status VLogRWFile::Write(uint32_t offset, const ValueBatch* batch) {
+  if (batch == nullptr) {
+    Status s = Status::InvalidArgument("null value batch");
+    CompleteWrite(offset, s);
+    return s;
+  }
+
+  Status s;
+  if (batch->borrowed_ && batch->NumEntries() == 1) {
+    const auto& record = batch->BorrowedRecordAt(0);
+    std::string header;
+    PutVarint32(&header, record.key.size());
+    PutVarint32(&header, record.value.size());
+    const Slice parts[] = {Slice(header), record.key, record.value};
+    s = file_->WriteAtV(offset, parts, 3);
+  } else if (batch->borrowed_) {
+    std::vector<std::string> headers;
+    std::vector<Slice> parts;
+    headers.reserve(batch->NumEntries());
+    parts.reserve(batch->NumEntries() * 3);
+    for (size_t i = 0; i < batch->NumEntries(); ++i) {
+      const auto& record = batch->BorrowedRecordAt(i);
+      headers.emplace_back();
+      PutVarint32(&headers.back(), record.key.size());
+      PutVarint32(&headers.back(), record.value.size());
+      parts.emplace_back(headers.back());
+      parts.emplace_back(record.key);
+      parts.emplace_back(record.value);
+    }
+    s = file_->WriteAtV(offset, parts.data(), parts.size());
+  } else {
+    const Slice part(batch->data(), batch->size());
+    s = file_->WriteAtV(offset, &part, 1);
+  }
+
+  CompleteWrite(offset, s);
+  if (s.ok()) MaybeScheduleBackgroundSync();
+  return s;
+}
+
+Status VLogRWFile::SyncThrough(uint32_t end) {
+  uint32_t sync_target;
+  {
+    MutexLock lock(&state_mutex_);
+    if (end > reserved_end_) {
+      return Status::InvalidArgument("value-log sync exceeds reserved range");
+    }
+    while (status_.ok() && readable_end_ < end &&
+           (write_failure_.ok() || failed_offset_ >= end)) {
+      state_cv_.Wait();
+    }
+    if (!status_.ok()) return status_;
+    if (!write_failure_.ok() && failed_offset_ < end) {
+      return write_failure_;
+    }
+    if (readable_end_ < end) {
+      return Status::IOError("value-log range is not readable");
+    }
+    if (durable_end_ >= end) return Status::OK();
+    sync_target = readable_end_;
+  }
+
+  MutexLock sync_lock(&sync_mutex_);
+  {
+    MutexLock lock(&state_mutex_);
+    if (!status_.ok()) return status_;
+    if (!write_failure_.ok() && failed_offset_ < end) {
+      return write_failure_;
+    }
+    if (durable_end_ >= end) return Status::OK();
+    sync_target = readable_end_;
+  }
+  Status s = file_->Sync();
+  {
+    MutexLock lock(&state_mutex_);
+    if (s.ok()) {
+      durable_end_ = std::max(durable_end_, sync_target);
+    } else {
+      SaveError(s);
+    }
+    state_cv_.SignalAll();
+    return status_.ok() ? s : status_;
+  }
+}
+
+Status VLogRWFile::Finish() {
+  uint32_t valid_end;
+  bool truncate = false;
+  {
+    MutexLock lock(&state_mutex_);
+    if (closed_) return ResultStatus();
+    sealed_ = true;
+    while (in_flight_ != 0) state_cv_.Wait();
+    valid_end = readable_end_;
+    truncate = reserved_end_ != valid_end;
+  }
+
+  if (truncate) {
+    Status truncate_status = file_->Truncate(valid_end);
+    MutexLock lock(&state_mutex_);
+    SaveError(truncate_status);
+    reserved_end_ = valid_end;
+    pending_writes_.clear();
+  }
+
+  Status s = SyncThrough(valid_end);
+  {
+    MutexLock lock(&state_mutex_);
+    // A scheduled writeback owns a file reference, but may still be queued in
+    // an Env supplied by the caller. Do not let DB destruction return while a
+    // task can still call through that Env.
+    while (background_sync_active_) {
+      state_cv_.Wait();
+    }
+    SaveError(s);
+    closed_ = true;
+    s = ResultStatus();
+  }
+  if (file_ != nullptr && refs_.load(std::memory_order_acquire) <= 1) {
+    Status close_status = file_->Close();
+    file_closed_ = true;
+    MutexLock lock(&state_mutex_);
+    SaveError(close_status);
+    s = ResultStatus();
+  }
+  return s;
+}
+
+Status VLogRWFile::status() {
+  MutexLock lock(&state_mutex_);
+  return ResultStatus();
+}
+
+uint32_t VLogRWFile::Offset() {
+  MutexLock lock(&state_mutex_);
+  return reserved_end_;
+}
+
+uint32_t VLogRWFile::FileSize() { return Offset(); }
+
+uint32_t VLogRWFile::ReadableSize() {
+  MutexLock lock(&state_mutex_);
+  return readable_end_;
+}
 
 ValueLogImpl::ValueLogImpl(const Options& options, const std::string& dbname,
                            DB* db)
@@ -40,7 +357,7 @@ Status ValueLogImpl::Put(const WriteOptions& options, const Slice& key,
   batch.Put(key, value);
   Status s = Write(options, &batch);
   if (s.ok()) {
-    *handle = batch.handles_[0];
+    *handle = batch.Handle(0);
   }
   return s;
 }
@@ -54,15 +371,37 @@ Status ValueLogImpl::Write(const WriteOptions& options, ValueBatch* batch,
     return Status::InvalidArgument("null value batch");
   }
 
+  WriteReservation reservation;
+  Status s = ReserveWrite(batch, publication_token != nullptr, &reservation);
+  if (!s.ok()) {
+    return s;
+  }
+  s = WriteReserved(reservation, batch);
+  if (options.sync) {
+    if (s.ok()) s = reservation.file->SyncThrough(reservation.end);
+  }
+  if (s.ok() && publication_token != nullptr) {
+    *publication_token = reservation.file_number;
+    ReleaseReservation(&reservation, false);
+  } else {
+    ReleaseReservation(&reservation, true);
+  }
+  return s;
+}
+
+Status ValueLogImpl::ReserveWrite(ValueBatch* batch, bool pin_publication,
+                                  WriteReservation* reservation) {
+  if (batch == nullptr || reservation == nullptr) {
+    return Status::InvalidArgument("null value-log write reservation");
+  }
+  *reservation = WriteReservation();
+
   MutexLock append_lock(&append_mutex_);
   VLogRWFile* file = RefCurrentFile();
   if (file == nullptr) {
     return Status::IOError("value log has no writable file");
   }
 
-  // Keep ordinary files within the configured target. An individually large
-  // batch still gets its own oversized file rather than forcing an empty
-  // rollover loop.
   const uint64_t current_size = file->FileSize();
   if (current_size > 0 &&
       batch->size() > options_.blob_max_file_size -
@@ -70,53 +409,71 @@ Status ValueLogImpl::Write(const WriteOptions& options, ValueBatch* batch,
                                              options_.blob_max_file_size)) {
     Status s = FinishBuild(file);
     file->Unref();
-    if (!s.ok()) {
-      return s;
-    }
+    if (!s.ok()) return s;
     file = RefCurrentFile();
     if (file == nullptr) {
       return Status::IOError("value log has no writable file after rollover");
     }
   }
 
-  batch->Finalize(file->FileNumber(), file->Offset());
-  const uint64_t file_number = file->FileNumber();
-  Status s = file->Write(batch);
+  uint32_t offset = 0;
+  Status s = file->Reserve(batch->size(), batch->NumEntries(), &offset);
   if (!s.ok()) {
     file->Unref();
     return s;
   }
-  if (options.sync) {
-    s = file->Sync();
-    if (!s.ok()) {
-      file->Unref();
-      return s;
-    }
+  batch->Finalize(file->FileNumber(), offset);
+  if (pin_publication) {
+    MutexLock publication_lock(&publication_mutex_);
+    ++pending_publications_[file->FileNumber()];
   }
 
-  // Pin before rollover can schedule GC. The BlobDB caller releases this only
-  // after its corresponding handle batch has left DBImpl's writer queue.
-  if (publication_token != nullptr) {
-    WriteLock metadata_lock(&rwlock_);
-    ++pending_publications_[file_number];
+  reservation->file = file;
+  reservation->file_number = file->FileNumber();
+  reservation->offset = offset;
+  reservation->end = offset + static_cast<uint32_t>(batch->size());
+  reservation->publication_pinned = pin_publication;
+  return Status::OK();
+}
+
+Status ValueLogImpl::WriteReserved(const WriteReservation& reservation,
+                                   const ValueBatch* batch) {
+  if (reservation.file == nullptr) {
+    return Status::InvalidArgument("empty value-log write reservation");
   }
-  if (file->FileSize() > options_.blob_max_file_size) {
-    s = FinishBuild(file);
+  Status s = reservation.file->Write(reservation.offset, batch);
+
+  // Preserve the established behavior for a single record/batch larger than
+  // the target file size: once its positioned write is complete, seal that
+  // oversized file and install a fresh writable vlog. Normal-sized batches
+  // roll before reservation and do not take this path. Later reservations
+  // which raced onto the same file are drained by FinishBuild(); only the
+  // first finisher that still observes this as the current file performs the
+  // metadata transition.
+  if (s.ok() && reservation.end > options_.blob_max_file_size) {
+    MutexLock append_lock(&append_mutex_);
+    VLogRWFile* current = RefCurrentFile();
+    if (current == reservation.file) {
+      s = FinishBuild(current);
+    }
+    if (current != nullptr) current->Unref();
   }
-  if (!s.ok() && publication_token != nullptr) {
-    WriteLock metadata_lock(&rwlock_);
-    auto it = pending_publications_.find(file_number);
-    assert(it != pending_publications_.end() && it->second > 0);
-    if (--it->second == 0) pending_publications_.erase(it);
-  } else if (publication_token != nullptr) {
-    *publication_token = file_number;
-  }
-  file->Unref();
   return s;
 }
 
+void ValueLogImpl::ReleaseReservation(WriteReservation* reservation,
+                                      bool release_publication) {
+  if (reservation == nullptr || reservation->file == nullptr) return;
+  if (release_publication && reservation->publication_pinned) {
+    ReleasePublication(reservation->file_number);
+    reservation->publication_pinned = false;
+  }
+  reservation->file->Unref();
+  reservation->file = nullptr;
+}
+
 VLogRWFile* ValueLogImpl::RefCurrentFile() {
-  ReadLock metadata_lock(&rwlock_);
+  append_mutex_.AssertHeld();
   VLogRWFile* file = rwfile_;
   if (file != nullptr) {
     file->Ref();
@@ -124,22 +481,36 @@ VLogRWFile* ValueLogImpl::RefCurrentFile() {
   return file;
 }
 
-void ValueLogImpl::ReleasePublication(uint64_t publication_token) {
-  if (publication_token == 0) return;
+void ValueLogImpl::ReleasePublication(uint64_t publication_token,
+                                      size_t count) {
+  if (publication_token == 0 || count == 0) return;
+
+  bool last_publication = false;
+  {
+    MutexLock lock(&publication_mutex_);
+    auto it = pending_publications_.find(publication_token);
+    assert(it != pending_publications_.end() && it->second >= count);
+    it->second -= count;
+    if (it->second == 0) {
+      pending_publications_.erase(it);
+      last_publication = true;
+    }
+  }
+  if (!last_publication) return;
 
   bool retry_deferred_gc = false;
   {
     WriteLock lock(&rwlock_);
-    auto it = pending_publications_.find(publication_token);
-    assert(it != pending_publications_.end() && it->second > 0);
-    if (--it->second == 0) {
-      pending_publications_.erase(it);
-      retry_deferred_gc = deferred_gc_files_.erase(publication_token) != 0;
-    }
+    retry_deferred_gc = deferred_gc_files_.erase(publication_token) != 0;
   }
   if (retry_deferred_gc) {
     ManualGC(publication_token);
   }
+}
+
+bool ValueLogImpl::HasPendingPublication(uint64_t number) {
+  MutexLock lock(&publication_mutex_);
+  return pending_publications_.count(number) != 0;
 }
 
 Status ValueLogImpl::SyncVLog() {
@@ -148,13 +519,13 @@ Status ValueLogImpl::SyncVLog() {
   if (file == nullptr) {
     return Status::IOError("value log has no writable file");
   }
-  Status s = file->Sync();
+  Status s = file->SyncThrough(file->ReadableSize());
   file->Unref();
   return s;
 }
 
 Status ValueLogImpl::SyncLSM() {
-  WriteLock commit(&commit_lock_);
+  if (owner_ != nullptr) return owner_->SyncLSM();
   Status s = SyncVLog();
   if (s.ok()) {
     s = db_->Sync();
@@ -499,14 +870,7 @@ Status ValueLogImpl::Recover() {
 }
 
 ValueLogImpl::~ValueLogImpl() {
-  StopGCThread();
-
-  mutex_.Lock();
-  shutdown_.store(true, std::memory_order_release);
-  while (bg_garbage_collection_) {
-    bg_work_cv_.Wait();
-  }
-  mutex_.Unlock();
+  StopBackgroundWork();
 
   {
     MutexLock append_lock(&append_mutex_);
@@ -529,6 +893,14 @@ ValueLogImpl::~ValueLogImpl() {
   delete manifest_log_;
   delete manifest_file_;
   delete vlog_cache_;
+}
+
+void ValueLogImpl::StopBackgroundWork() {
+  StopGCThread();
+  mutex_.Lock();
+  shutdown_.store(true, std::memory_order_release);
+  while (bg_garbage_collection_) bg_work_cv_.Wait();
+  mutex_.Unlock();
 }
 
 void ValueLogImpl::StartGCThread() {
@@ -879,11 +1251,11 @@ void ValueLogImpl::RemoveObsoleteFiles() {
         case kVLogManifestFile:
           keep = (number >= manifest_number_);
           break;
-        case kVLogFile:
+        case kVLogFile: {
+          const bool publication_pending = HasPendingPublication(number);
           keep = ro_files_.find(number) != ro_files_.end() ||
                  pending_outputs_.find(number) != pending_outputs_.end() ||
-                 pending_publications_.find(number) !=
-                     pending_publications_.end() ||
+                 publication_pending ||
                  (rwfile_ && number == rwfile_->FileNumber());
           if (!keep) {
             /*
@@ -899,7 +1271,7 @@ void ValueLogImpl::RemoveObsoleteFiles() {
           /*
            * Checking whether to remove obsolete files on disk.
            */
-          if (pending_publications_.count(number) == 0 &&
+          if (!publication_pending &&
               obsolete_files_.find(number) != obsolete_files_.end()) {
             assert(pending_outputs_.find(number) == pending_outputs_.end());
             SequenceNumber smallest = db_->SmallestSequence();
@@ -912,6 +1284,7 @@ void ValueLogImpl::RemoveObsoleteFiles() {
             }
           }
           break;
+        }
         default:
           /*
            * LSM files will be handled by DBImpl

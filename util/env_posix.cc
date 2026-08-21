@@ -9,6 +9,7 @@
 #ifndef __Fuchsia__
 #include <sys/resource.h>
 #endif
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <climits>
@@ -493,8 +494,8 @@ class PosixAppendableRandomAccessFile final
     // file at the last fully appended offset so an orderly shutdown cannot
     // turn that partial record into recovery input.
     if (fd_ >= 0) {
-      const int truncate_result =
-          ::ftruncate(fd_, static_cast<off_t>(len_));
+      const int truncate_result = ::ftruncate(
+          fd_, static_cast<off_t>(len_.load(std::memory_order_acquire)));
       (void)truncate_result;
       (void)::close(fd_);
     }
@@ -503,7 +504,8 @@ class PosixAppendableRandomAccessFile final
   Status Read(uint64_t offset, size_t n, Slice* result,
               char* scratch) const override {
     ReadLock l(&rwlock);
-    if (offset > len_ || n > len_ - offset) {
+    const uint64_t logical_size = len_.load(std::memory_order_acquire);
+    if (offset > logical_size || n > logical_size - offset) {
       *result = Slice();
       return Status::InvalidArgument(filename_, "read past end of file");
     }
@@ -537,7 +539,9 @@ class PosixAppendableRandomAccessFile final
     }
     const uint64_t max_offset =
         static_cast<uint64_t>(std::numeric_limits<off_t>::max());
-    if (len_ > max_offset || data.size() > max_offset - len_) {
+    const uint64_t append_offset = len_.load(std::memory_order_relaxed);
+    if (append_offset > max_offset ||
+        data.size() > max_offset - append_offset) {
       status_ = Status::InvalidArgument(filename_, "file is too large");
       return status_;
     }
@@ -546,7 +550,7 @@ class PosixAppendableRandomAccessFile final
     while (done < data.size()) {
       const ssize_t write_result =
           ::pwrite(fd_, data.data() + done, data.size() - done,
-                   static_cast<off_t>(len_ + done));
+                   static_cast<off_t>(append_offset + done));
       if (write_result < 0) {
         if (errno == EINTR) {
           continue;
@@ -560,7 +564,7 @@ class PosixAppendableRandomAccessFile final
       }
       done += static_cast<size_t>(write_result);
     }
-    len_ += data.size();
+    len_.store(append_offset + data.size(), std::memory_order_release);
     return Status::OK();
   }
 
@@ -584,26 +588,35 @@ class PosixAppendableRandomAccessFile final
       }
       total_size += parts[i].size();
     }
-    if (len_ > max_offset || total_size > max_offset - len_) {
+    const uint64_t append_offset = len_.load(std::memory_order_relaxed);
+    if (append_offset > max_offset || total_size > max_offset - append_offset) {
       status_ = Status::InvalidArgument(filename_, "file is too large");
       return status_;
     }
 
-    const long configured_iov_max = ::sysconf(_SC_IOV_MAX);
-    const size_t max_iov = static_cast<size_t>(
-        configured_iov_max > 0 ? configured_iov_max : 1024);
-    std::vector<struct iovec> iovecs;
-    iovecs.reserve(max_iov);
+    static const size_t max_iov = [] {
+      const long configured = ::sysconf(_SC_IOV_MAX);
+      return static_cast<size_t>(configured > 0 ? configured : 1024);
+    }();
+    constexpr size_t kInlineIovecs = 16;
+    const size_t iovec_capacity = std::min(count, max_iov);
+    std::array<struct iovec, kInlineIovecs> inline_iovecs;
+    std::vector<struct iovec> overflow_iovecs;
+    struct iovec* iovecs = inline_iovecs.data();
+    if (iovec_capacity > inline_iovecs.size()) {
+      overflow_iovecs.resize(iovec_capacity);
+      iovecs = overflow_iovecs.data();
+    }
 
     size_t part_index = 0;
     size_t part_offset = 0;
     uint64_t done = 0;
     while (part_index < count) {
-      iovecs.clear();
+      size_t iovec_count = 0;
       size_t next_index = part_index;
       size_t next_offset = part_offset;
       size_t call_size = 0;
-      while (next_index < count && iovecs.size() < max_iov &&
+      while (next_index < count && iovec_count < iovec_capacity &&
              call_size < static_cast<size_t>(SSIZE_MAX)) {
         if (next_offset == parts[next_index].size()) {
           ++next_index;
@@ -617,7 +630,7 @@ class PosixAppendableRandomAccessFile final
         iov.iov_base =
             const_cast<char*>(parts[next_index].data() + next_offset);
         iov.iov_len = length;
-        iovecs.push_back(iov);
+        iovecs[iovec_count++] = iov;
         call_size += length;
         if (length == available) {
           ++next_index;
@@ -627,12 +640,12 @@ class PosixAppendableRandomAccessFile final
         }
       }
 
-      if (iovecs.empty()) {
+      if (iovec_count == 0) {
         break;
       }
       const ssize_t write_result =
-          ::pwritev(fd_, iovecs.data(), static_cast<int>(iovecs.size()),
-                    static_cast<off_t>(len_ + done));
+          ::pwritev(fd_, iovecs, static_cast<int>(iovec_count),
+                    static_cast<off_t>(append_offset + done));
       if (write_result < 0) {
         if (errno == EINTR) {
           continue;
@@ -664,7 +677,134 @@ class PosixAppendableRandomAccessFile final
       status_ = Status::IOError(filename_, "incomplete pwritev");
       return status_;
     }
-    len_ += total_size;
+    len_.store(append_offset + total_size, std::memory_order_release);
+    return Status::OK();
+  }
+
+  Status WriteAtV(uint64_t offset, const Slice* parts,
+                  size_t count) override {
+    if (parts == nullptr && count != 0) {
+      return Status::InvalidArgument(filename_, "null write vector");
+    }
+
+    const uint64_t max_offset =
+        static_cast<uint64_t>(std::numeric_limits<off_t>::max());
+    uint64_t total_size = 0;
+    for (size_t i = 0; i < count; ++i) {
+      if (parts[i].size() > max_offset - total_size) {
+        return Status::InvalidArgument(filename_, "file is too large");
+      }
+      total_size += parts[i].size();
+    }
+    if (offset > max_offset || total_size > max_offset - offset) {
+      return Status::InvalidArgument(filename_, "file is too large");
+    }
+    // Close and Truncate require the caller to drain positioned writes. Avoid
+    // the writer-preferring RWMutex here: taking it once before and once after
+    // every pwritev turns concurrent disjoint writes into a lock convoy. Sync
+    // intentionally may overlap pwritev on the stable descriptor.
+    const int fd = fd_;
+    if (fd < 0) return Status::IOError(filename_, "file is closed");
+    if (total_size == 0) return Status::OK();
+
+    static const size_t max_iov = [] {
+      const long configured = ::sysconf(_SC_IOV_MAX);
+      return static_cast<size_t>(configured > 0 ? configured : 1024);
+    }();
+    constexpr size_t kInlineIovecs = 16;
+    const size_t iovec_capacity = std::min(count, max_iov);
+    std::array<struct iovec, kInlineIovecs> inline_iovecs;
+    std::vector<struct iovec> overflow_iovecs;
+    struct iovec* iovecs = inline_iovecs.data();
+    if (iovec_capacity > inline_iovecs.size()) {
+      overflow_iovecs.resize(iovec_capacity);
+      iovecs = overflow_iovecs.data();
+    }
+
+    size_t part_index = 0;
+    size_t part_offset = 0;
+    uint64_t done = 0;
+    while (part_index < count) {
+      size_t iovec_count = 0;
+      size_t next_index = part_index;
+      size_t next_offset = part_offset;
+      size_t call_size = 0;
+      while (next_index < count && iovec_count < iovec_capacity &&
+             call_size < static_cast<size_t>(SSIZE_MAX)) {
+        if (next_offset == parts[next_index].size()) {
+          ++next_index;
+          next_offset = 0;
+          continue;
+        }
+        const size_t available = parts[next_index].size() - next_offset;
+        const size_t length =
+            std::min(available, static_cast<size_t>(SSIZE_MAX) - call_size);
+        struct iovec iov;
+        iov.iov_base =
+            const_cast<char*>(parts[next_index].data() + next_offset);
+        iov.iov_len = length;
+        iovecs[iovec_count++] = iov;
+        call_size += length;
+        if (length == available) {
+          ++next_index;
+          next_offset = 0;
+        } else {
+          next_offset += length;
+        }
+      }
+
+      if (iovec_count == 0) break;
+      const ssize_t write_result =
+          ::pwritev(fd, iovecs, static_cast<int>(iovec_count),
+                    static_cast<off_t>(offset + done));
+      if (write_result < 0) {
+        if (errno == EINTR) continue;
+        return PosixError(filename_, errno);
+      }
+      if (write_result == 0) {
+        return Status::IOError(filename_, "zero-byte pwritev");
+      }
+
+      size_t consumed = static_cast<size_t>(write_result);
+      done += consumed;
+      while (part_index < count && consumed != 0) {
+        const size_t available = parts[part_index].size() - part_offset;
+        if (consumed < available) {
+          part_offset += consumed;
+          consumed = 0;
+        } else {
+          consumed -= available;
+          ++part_index;
+          part_offset = 0;
+        }
+      }
+    }
+
+    if (done != total_size) {
+      return Status::IOError(filename_, "incomplete pwritev");
+    }
+    const uint64_t write_end = offset + total_size;
+    uint64_t observed = len_.load(std::memory_order_relaxed);
+    while (observed < write_end &&
+           !len_.compare_exchange_weak(observed, write_end,
+                                       std::memory_order_release,
+                                       std::memory_order_relaxed)) {
+    }
+    return Status::OK();
+  }
+
+  Status Truncate(uint64_t size) override {
+    WriteLock l(&rwlock);
+    const uint64_t max_offset =
+        static_cast<uint64_t>(std::numeric_limits<off_t>::max());
+    if (size > max_offset) {
+      return Status::InvalidArgument(filename_, "file is too large");
+    }
+    if (fd_ < 0) return Status::IOError(filename_, "file is closed");
+    if (::ftruncate(fd_, static_cast<off_t>(size)) != 0) {
+      return PosixError(filename_, errno);
+    }
+    len_.store(size, std::memory_order_release);
     return Status::OK();
   }
 
@@ -676,7 +816,9 @@ class PosixAppendableRandomAccessFile final
     // Even after an append error, discard any partial trailing pwrite before
     // closing. Preserve the original error unless truncation is the first
     // failure observed by this file.
-    if (::ftruncate(fd_, static_cast<off_t>(len_)) != 0 && status_.ok()) {
+    if (::ftruncate(fd_, static_cast<off_t>(
+                              len_.load(std::memory_order_acquire))) != 0 &&
+        status_.ok()) {
       status_ = PosixError(filename_, errno);
     }
     if (::close(fd_) != 0 && status_.ok()) {
@@ -724,8 +866,7 @@ class PosixAppendableRandomAccessFile final
   }
 
   uint64_t Offset() override {
-    ReadLock l(&rwlock);
-    return len_;
+    return len_.load(std::memory_order_acquire);
   }
 
  private:
@@ -744,7 +885,7 @@ class PosixAppendableRandomAccessFile final
   Status status_;
   const std::string filename_;
   const std::string dirname_;
-  uint64_t len_ GUARDED_BY(rwlock);
+  std::atomic<uint64_t> len_;
   int fd_ GUARDED_BY(rwlock);
   bool dir_synced_{false};
 };

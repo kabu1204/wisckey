@@ -78,21 +78,23 @@ class BlobDB : public DB {
  private:
   friend class DB;
   friend class ValueLogImpl;
+  class WriteCoordinator;
 
-  BlobDB(const Options& options, std::string dbname, DB* db, ValueLogImpl* vlog)
-      : db_(reinterpret_cast<DBImpl*>(db)),
-        vlog_(vlog),
-        options_(options),
-        dbname_(std::move(dbname)) {}
+  BlobDB(const Options& options, std::string dbname, DB* db,
+         ValueLogImpl* vlog);
 
-  Status WriteInternal(const WriteOptions& options, WriteBatch* updates,
-                       WriteCallback* callback);
+  // Publish an already-transformed internal batch through the same ordered
+  // WAL queue as foreground BlobDB writes. Used by value-log GC, whose
+  // replacement handles already refer to a separately synced vlog.
+  Status WriteLSM(const WriteOptions& options, WriteBatch* updates,
+                  WriteCallback* callback);
 
   Options options_;
   std::string dbname_;
 
   DBImpl* const db_;
   ValueLogImpl* const vlog_;
+  WriteCoordinator* const write_coordinator_;
 };
 
 }  // namespace leveldb

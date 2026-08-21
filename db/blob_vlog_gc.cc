@@ -280,7 +280,7 @@ GarbageCollection* ValueLogImpl::PickGC(uint64_t number) {
       return nullptr;
     }
     if (obsolete_files_.find(it->first) == obsolete_files_.end()) {
-      if (pending_publications_.count(it->first) != 0) {
+      if (HasPendingPublication(it->first)) {
         deferred_gc_files_.insert(it->first);
         number = it->first + 1;
         continue;
@@ -339,7 +339,7 @@ Status ValueLogImpl::RunGC() {
       if (obsolete_files_.count(number) != 0) {
         continue;
       }
-      if (pending_publications_.count(number) != 0) {
+      if (HasPendingPublication(number)) {
         deferred_gc_files_.insert(number);
         continue;
       }
@@ -355,7 +355,7 @@ Status ValueLogImpl::RunGC() {
       }
       // A rolled file can still have an unpublished handle batch. Never
       // collect it until that writer leaves DBImpl's publication queue.
-      if (pending_publications_.count(number) != 0) {
+      if (HasPendingPublication(number)) {
         deferred_gc_files_.insert(number);
         continue;
       }
@@ -696,7 +696,8 @@ Status ValueLogImpl::Rewrite(GarbageCollection* gc) {
     WriteBatchInternal::Put(&rewrite, new_iter->key(), handle_encoding,
                             kTypeValueHandle);
     ValueLogGCWriteCallback callback(new_iter->key().ToString(), current);
-    s = db_->Write(opt, &rewrite, &callback);
+    s = owner_ != nullptr ? owner_->WriteLSM(opt, &rewrite, &callback)
+                          : db_->Write(opt, &rewrite, &callback);
     if (!callback.applied() &&
         (callback.result().IsNotFound() ||
          callback.result().IsInvalidArgument())) {
