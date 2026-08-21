@@ -577,6 +577,14 @@ TEST_F(DBTest, Empty) {
   } while (ChangeOptions());
 }
 
+TEST_F(DBTest, MissingGetDoesNotPublishValueType) {
+  std::string value;
+  ValueType value_type = kTypeValueHandle;
+  ASSERT_TRUE(
+      dbfull()->Get(ReadOptions(), "missing", &value, &value_type).IsNotFound());
+  ASSERT_EQ(kTypeValueHandle, value_type);
+}
+
 TEST_F(DBTest, EmptyKey) {
   do {
     ASSERT_LEVELDB_OK(Put("", "v1"));

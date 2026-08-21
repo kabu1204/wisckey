@@ -64,12 +64,18 @@ class VLogReader {
 
   VLogReaderIterator* NewIterator(const ReadOptions&) const;
 
+  // Read and decode the record identified by a value handle without creating
+  // an iterator or re-encoding the handle.
+  Status Get(const ReadOptions&, uint32_t offset, uint32_t size,
+             std::string* value) const;
+
   /*
    * Iterate through the file, stop when !iter->Valid(),
    * storing the validated size and num_entries of the file in the arguments.
    * return false when *offset != fileSize.
    */
-  bool Validate(uint64_t* offset, uint64_t* num_entries);
+  bool Validate(uint64_t* offset, uint64_t* num_entries,
+                Status* status = nullptr);
 
   void IncreaseOffset(uint32_t new_offset);
 

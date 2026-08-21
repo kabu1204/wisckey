@@ -67,6 +67,10 @@ class BlobDB : public DB {
 
   void ManualGC(uint64_t number);
 
+  // Synchronously visit each value-log file that was eligible when this call
+  // began. Replacement files created by this run are not revisited.
+  Status RunVLogGC();
+
   void WaitVLogGC();
 
   Status VLogBGError();
@@ -81,13 +85,12 @@ class BlobDB : public DB {
         options_(options),
         dbname_(std::move(dbname)) {}
 
-  Status DivideWriteBatch(WriteBatch* input, WriteBatch* small,
-                          ValueBatch* large);
+  Status WriteInternal(const WriteOptions& options, WriteBatch* updates,
+                       WriteCallback* callback);
 
   Options options_;
   std::string dbname_;
 
-  port::RWMutex rwlock_;
   DBImpl* const db_;
   ValueLogImpl* const vlog_;
 };

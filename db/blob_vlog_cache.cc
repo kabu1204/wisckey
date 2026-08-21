@@ -76,6 +76,22 @@ Status VLogCache::Get(const ReadOptions& options, uint64_t file_number,
   return s;
 }
 
+Status VLogCache::Get(const ReadOptions& options, Cache::Handle* handle,
+                      uint32_t offset, uint32_t size, std::string* value) {
+  if (handle == nullptr) {
+    return Status::InvalidArgument("null value log cache handle");
+  }
+  VLogReader* reader =
+      reinterpret_cast<TableAndFile*>(cache_->Value(handle))->table;
+  return reader->Get(options, offset, size, value);
+}
+
+void VLogCache::Release(Cache::Handle* handle) {
+  if (handle != nullptr) {
+    cache_->Release(handle);
+  }
+}
+
 void VLogCache::Evict(uint64_t file_number) {
     char buf[sizeof(file_number)];
     EncodeFixed64(buf, file_number);
@@ -84,6 +100,9 @@ void VLogCache::Evict(uint64_t file_number) {
 
 Status VLogCache::FindReader(uint64_t file_number, uint64_t file_size,
                                   Cache::Handle** handle) {
+  if (handle == nullptr) {
+    return Status::InvalidArgument("null value log cache handle output");
+  }
   Status s;
   char buf[sizeof(file_number)];
   EncodeFixed64(buf, file_number);
@@ -99,7 +118,6 @@ Status VLogCache::FindReader(uint64_t file_number, uint64_t file_size,
     }
 
     if(!s.ok()) {
-      assert(reader == nullptr);
       delete file;
     } else {
       TableAndFile* tf = new TableAndFile;

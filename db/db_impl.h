@@ -44,6 +44,13 @@ class DBImpl : public DB {
   Status Write(const WriteOptions& options, WriteBatch* updates) override;
   Status Write(const WriteOptions& options, WriteBatch* updates,
                WriteCallback* callback) override;
+
+  // Describes whether a failed Write may nevertheless be present in the WAL.
+  // BlobDB uses this to retain value-log publication pins only when recovery
+  // could later expose the corresponding handle batch.
+  enum class WriteState { kNotWritten, kMayBeWritten, kApplied };
+  Status WriteWithOutcome(const WriteOptions& options, WriteBatch* updates,
+                          WriteCallback* callback, WriteState* write_state);
   Status Get(const ReadOptions& options, const Slice& key,
              std::string* value) override;
   Status Get(const ReadOptions& options, const Slice& key, std::string* value,
@@ -76,6 +83,9 @@ class DBImpl : public DB {
   int64_t TEST_MaxNextLevelOverlappingBytes();
 
   void TEST_BuildWriterGroup();
+
+  // Return the number of writes waiting in the serialized writer queue.
+  size_t TEST_WriterQueueSize();
 
   // Record a sample of bytes read at the specified internal key.
   // Samples are taken approximately once every config::kReadBytesPeriod

@@ -169,9 +169,10 @@ struct LEVELDB_EXPORT Options {
   // Default: 600s
   int blob_gc_interval = 600;
 
-  // Number of background read threads for concurrent prefetch during iteration
-  // Default: 8
-  int blob_background_read_threads = 8;
+  // Number of background read threads for concurrent prefetch during
+  // iteration. Prefetch is opt-in because it is slower for cached scans.
+  // Default: 0
+  int blob_background_read_threads = 0;
 };
 
 // Options that control read operations
@@ -184,8 +185,9 @@ struct LEVELDB_EXPORT ReadOptions {
   // Callers may wish to set this field to false for bulk scans.
   bool fill_cache = true;
 
-  // If true, background concurrent prefetch for BlobDBIterator
-  bool blob_prefetch = true;
+  // If true, enable background concurrent prefetch for BlobDBIterator.
+  // This can help storage-bound scans, but adds overhead for cached data.
+  bool blob_prefetch = false;
 
   // If "snapshot" is non-null, read as of the supplied snapshot
   // (which must belong to the DB that is being read and which must

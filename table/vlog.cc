@@ -9,6 +9,9 @@
 
 #include "table/vlog.h"
 
+#include <atomic>
+#include <limits>
+
 #include "db/write_batch_internal.h"
 
 #include "table/value_batch.h"
@@ -24,7 +27,7 @@ struct VLogBuilder::Rep {
   AppendableRandomAccessFile* file;
   bool closed{false};
   uint32_t num_entries{0};
-  uint32_t offset{0};
+  std::atomic<uint32_t> offset{0};
 
   char buf[1024];
   std::string compressed;
@@ -36,7 +39,7 @@ VLogBuilder::VLogBuilder(const Options& options,
     : rep_(new Rep(options, file))
 {
   if (reuse) {
-    rep_->offset = offset;
+    rep_->offset.store(offset, std::memory_order_relaxed);
     rep_->num_entries = num_entries;
   }
 }
@@ -50,13 +53,25 @@ VLogBuilder::~VLogBuilder() {
 void VLogBuilder::Add(const Slice& key, const Slice& value, ValueHandle* handle) {
   assert(!rep_->closed);
   if(!ok()) return;
-  uint32_t size = key.size() + value.size();
+  const uint64_t payload_size =
+      static_cast<uint64_t>(key.size()) + value.size();
+  if (payload_size > std::numeric_limits<uint32_t>::max() - 10) {
+    rep_->status = Status::InvalidArgument("value log record is too large");
+    return;
+  }
+  uint32_t size = static_cast<uint32_t>(payload_size);
   // TODO: directly append to file
   char *buf = (size + 10) > 1024 ? new char[size+10]: rep_->buf;
 
   char *ptr = EncodeVarint32(buf, key.size());
   ptr = EncodeVarint32(ptr, value.size());
   size += (ptr - buf);
+  const uint32_t offset = rep_->offset.load(std::memory_order_relaxed);
+  if (size > std::numeric_limits<uint32_t>::max() - offset) {
+    if(buf != rep_->buf) delete[] buf;
+    rep_->status = Status::InvalidArgument("value log file is larger than 4 GiB");
+    return;
+  }
   std::memcpy(ptr, key.data(), key.size());
   std::memcpy(ptr + key.size(), value.data(), value.size());
   rep_->status = rep_->file->Append(Slice(buf, size));
@@ -68,31 +83,61 @@ void VLogBuilder::Add(const Slice& key, const Slice& value, ValueHandle* handle)
   }
 
   if (handle != nullptr) {
-    handle->offset_ = rep_->offset;
+    handle->offset_ = offset;
     handle->size_ = size;
   }
-  rep_->offset += size;
+  rep_->offset.store(offset + size, std::memory_order_release);
   rep_->num_entries++;
 }
 
 void VLogBuilder::AddBatch(const ValueBatch* batch) {
+  assert(!rep_->closed);
+  if (!ok()) return;
+  const uint32_t offset = rep_->offset.load(std::memory_order_relaxed);
+  if (batch->size() > std::numeric_limits<uint32_t>::max() - offset) {
+    rep_->status =
+        Status::InvalidArgument("value log file is larger than 4 GiB");
+    return;
+  }
+  if (batch->borrowed_) {
+    std::vector<std::string> headers;
+    std::vector<Slice> parts;
+    headers.reserve(batch->borrowed_records_.size());
+    parts.reserve(batch->borrowed_records_.size() * 3);
+    for (const auto& record : batch->borrowed_records_) {
+      headers.emplace_back();
+      PutVarint32(&headers.back(), record.key.size());
+      PutVarint32(&headers.back(), record.value.size());
+      parts.emplace_back(headers.back());
+      parts.emplace_back(record.key);
+      parts.emplace_back(record.value);
+    }
+    rep_->status = rep_->file->AppendV(parts.data(), parts.size());
+    if (!ok()) return;
+    rep_->offset.store(offset + static_cast<uint32_t>(batch->size()),
+                       std::memory_order_release);
+    rep_->num_entries += batch->NumEntries();
+    return;
+  }
   rep_->status = rep_->file->Append(Slice(batch->data(), batch->size()));
   if (!ok()) return;
 
-  rep_->offset += batch->size();
+  rep_->offset.store(offset + static_cast<uint32_t>(batch->size()),
+                     std::memory_order_release);
   rep_->num_entries += batch->NumEntries();
 }
 
 void VLogBuilder::Flush() {
   assert(!rep_->closed);
+  if (!ok()) return;
   rep_->status = rep_->file->Flush();
 }
 
 Status VLogBuilder::status() const { return rep_->status; }
 
 Status VLogBuilder::Finish() {
-  Flush();
   assert(!rep_->closed);
+  Flush();
   rep_->closed = true;
   return rep_->status;
 }
@@ -104,9 +149,13 @@ void VLogBuilder::Abandon() {
 
 uint64_t VLogBuilder::NumEntries() const { return rep_->num_entries; }
 
-uint64_t VLogBuilder::FileSize() const { return rep_->offset; }
+uint64_t VLogBuilder::FileSize() const {
+  return rep_->offset.load(std::memory_order_acquire);
+}
 
-uint64_t VLogBuilder::Offset() const { return rep_->offset; }
+uint64_t VLogBuilder::Offset() const {
+  return rep_->offset.load(std::memory_order_acquire);
+}
 
 struct VLogReader::Rep {
   Rep(const Options& opt, RandomAccessFile* f, uint32_t lim)
@@ -117,12 +166,13 @@ struct VLogReader::Rep {
 
   Options option;
   Status status;
-  uint32_t limit;
+  std::atomic<uint32_t> limit;
   RandomAccessFile* file;
 };
 
-static inline const char* DecodeEntry(const char* p, const char* limit,
-                                      uint32_t* key_len, uint32_t* value_len) {
+static inline const char* DecodeEntryHeader(const char* p, const char* limit,
+                                            uint32_t* key_len,
+                                            uint32_t* value_len) {
   if (limit - p < 2) return nullptr;
   *key_len = reinterpret_cast<const uint8_t*>(p)[0];
   if ((*key_len) < 128) {
@@ -132,7 +182,16 @@ static inline const char* DecodeEntry(const char* p, const char* limit,
   }
   if ((p = GetVarint32Ptr(p, limit, value_len)) == nullptr) return nullptr;
 
-  if (static_cast<uint32_t>(limit - p) < (*key_len + *value_len)) {
+  return p;
+}
+
+static inline const char* DecodeEntry(const char* p, const char* limit,
+                                      uint32_t* key_len, uint32_t* value_len) {
+  p = DecodeEntryHeader(p, limit, key_len, value_len);
+  if (p == nullptr) return nullptr;
+
+  const size_t remaining = static_cast<size_t>(limit - p);
+  if (*key_len > remaining || *value_len > remaining - *key_len) {
     return nullptr;
   }
   return p;
@@ -141,11 +200,18 @@ static inline const char* DecodeEntry(const char* p, const char* limit,
 // When file is appendable, file_size should be the actually len of the file.
 Status VLogReader::Open(const Options& options, RandomAccessFile* file,
                         uint64_t file_size, VLogReader** reader) {
-  if(reader != nullptr) {
-    *reader = nullptr;
+  if (reader == nullptr) {
+    return Status::InvalidArgument("null value log reader output");
+  }
+  *reader = nullptr;
+  if (file == nullptr) {
+    return Status::InvalidArgument("null value log file");
+  }
+  if (file_size > std::numeric_limits<uint32_t>::max()) {
+    return Status::InvalidArgument("value log is larger than 4 GiB");
   }
 
-  Rep *rep = new Rep(options, file, file_size);
+  Rep *rep = new Rep(options, file, static_cast<uint32_t>(file_size));
   *reader = new VLogReader(rep);
 
   return Status::OK();
@@ -153,6 +219,82 @@ Status VLogReader::Open(const Options& options, RandomAccessFile* file,
 
 VLogReader::~VLogReader() {
   delete rep_;
+}
+
+Status VLogReader::Get(const ReadOptions& options, uint32_t offset,
+                       uint32_t size, std::string* value) const {
+  (void)options;
+  if (value == nullptr) {
+    return Status::InvalidArgument("null value output");
+  }
+
+  const uint32_t limit = rep_->limit.load(std::memory_order_acquire);
+  if (offset >= limit) {
+    return Status::InvalidArgument("value log offset is out of limit");
+  }
+
+  if (size == 0) {
+    char header_scratch[10];
+    Slice header;
+    const uint32_t header_size = std::min<uint32_t>(sizeof(header_scratch),
+                                                    limit - offset);
+    Status s =
+        rep_->file->Read(offset, header_size, &header, header_scratch);
+    if (!s.ok()) return s;
+
+    uint32_t key_len = 0;
+    uint32_t value_len = 0;
+    const char* p = DecodeEntryHeader(header.data(),
+                                      header.data() + header.size(), &key_len,
+                                      &value_len);
+    if (p == nullptr) {
+      return Status::Corruption("corrupted value log entry header");
+    }
+    const uint64_t decoded_size = static_cast<uint64_t>(p - header.data()) +
+                                  key_len + value_len;
+    if (decoded_size > limit - offset) {
+      return Status::Corruption("truncated value log entry");
+    }
+    size = static_cast<uint32_t>(decoded_size);
+  } else if (size > limit - offset) {
+    return Status::InvalidArgument("value log offset is out of limit");
+  }
+
+  char stack_scratch[512];
+  thread_local std::string reusable_scratch;
+  std::string oversized_scratch;
+  char* scratch = stack_scratch;
+  if (size > sizeof(stack_scratch)) {
+    constexpr size_t kMaxRetainedScratch = 1 << 20;
+    if (size <= kMaxRetainedScratch) {
+      if (reusable_scratch.size() < size) {
+        reusable_scratch.resize(size);
+      }
+      scratch = &reusable_scratch[0];
+    } else {
+      oversized_scratch.resize(size);
+      scratch = &oversized_scratch[0];
+    }
+  }
+
+  Slice result;
+  Status s = rep_->file->Read(offset, size, &result, scratch);
+  if (!s.ok()) {
+    return s;
+  }
+  if (result.size() != size) {
+    return Status::Corruption("short value log record");
+  }
+
+  uint32_t key_len = 0;
+  uint32_t value_len = 0;
+  const char* record_end = result.data() + result.size();
+  const char* p = DecodeEntry(result.data(), record_end, &key_len, &value_len);
+  if (p == nullptr || p + key_len + value_len != record_end) {
+    return Status::Corruption("corrupted value log entry");
+  }
+  value->assign(p + key_len, value_len);
+  return Status::OK();
 }
 
 bool VLogReaderIterator::ParseCurrentEntry(uint32_t size) {
@@ -168,22 +310,37 @@ bool VLogReaderIterator::ParseCurrentEntry(uint32_t size) {
     if (!status_.ok()) {
       return false;
     }
-    p = DecodeEntry(result.data(), result.data() - current_ + limit_, &key_len,
-                    &val_len);
+    p = DecodeEntryHeader(result.data(), result.data() + result.size(),
+                          &key_len, &val_len);
     if (p == nullptr) {
       status_ = Status::Corruption("corrupted vlog entry");
       return false;
     }
 
-    size = key_len + val_len + (p - result.data());
-    if (key_len + val_len > buf_size_) {
+    const uint64_t payload_size =
+        static_cast<uint64_t>(key_len) + static_cast<uint64_t>(val_len);
+    const uint64_t decoded_size =
+        static_cast<uint64_t>(p - result.data()) + payload_size;
+    if (decoded_size > limit_ - current_) {
+      status_ = Status::Corruption("truncated vlog entry");
+      return false;
+    }
+    size = static_cast<uint32_t>(decoded_size);
+    if (payload_size > buf_size_) {
       delete[] buf_;
-      buf_size_ = key_len + val_len;
+      buf_size_ = static_cast<size_t>(payload_size);
       buf_ = new char[buf_size_];
     }
     scratch = buf_;
-    status_ = file_->Read(current_ + (p - result.data()), key_len + val_len,
-                          &result, scratch);
+    status_ = file_->Read(current_ + (p - result.data()),
+                          static_cast<size_t>(payload_size), &result, scratch);
+    if (!status_.ok()) {
+      return false;
+    }
+    if (result.size() != payload_size) {
+      status_ = Status::Corruption("short value log record payload");
+      return false;
+    }
     p = result.data();
   } else {
     if (size > buf_size_) {
@@ -193,14 +350,18 @@ bool VLogReaderIterator::ParseCurrentEntry(uint32_t size) {
     }
     scratch = buf_;
     status_ = file_->Read(current_, size, &result, scratch);
+    if (!status_.ok()) {
+      return false;
+    }
+    if (result.size() != size) {
+      status_ = Status::Corruption("short value log record");
+      return false;
+    }
     p = DecodeEntry(result.data(), result.data() + result.size(), &key_len,
                     &val_len);
   }
 
-  if (!status_.ok()) {
-    return false;
-  }
-  if (p == nullptr) {
+  if (p == nullptr || p + key_len + val_len != result.data() + result.size()) {
     status_ = Status::Corruption("corrupted vlog entry");
     return false;
   }
@@ -227,11 +388,10 @@ void VLogReaderIterator::SeekToFirst() {
 }
 
 void VLogReaderIterator::SeekToLast() {
-  uint32_t prev;
-  if (current_ >= limit_) {
-    SeekToFirst();
-  }
-  prev = current_;
+  SeekToFirst();
+  if (!Valid()) return;
+
+  uint32_t prev = current_;
   for (Next(); Valid(); Next()) {
     prev = current_;
   }
@@ -243,6 +403,13 @@ void VLogReaderIterator::Seek(const Slice& target) {
   ValueHandle handle;
   Slice input = target;
   status_ = handle.DecodeFrom(&input);
+  if (status_.ok() && !input.empty()) {
+    status_ = Status::Corruption("trailing bytes in value-log handle");
+  }
+  if (!status_.ok()) {
+    valid_ = false;
+    return;
+  }
   current_ = handle.offset_;
   valid_ = ParseCurrentEntry(handle.size_);
 }
@@ -259,12 +426,13 @@ void VLogReaderIterator::GetValueHandle(ValueHandle* handle) const {
 }
 
 VLogReaderIterator* VLogReader::NewIterator(const ReadOptions& option) const {
-  return new VLogReaderIterator(rep_->file, rep_->limit);
+  return new VLogReaderIterator(
+      rep_->file, rep_->limit.load(std::memory_order_acquire));
 }
 
 void VLogReader::IncreaseOffset(uint32_t new_offset) {
-  assert(new_offset >= rep_->limit);
-  rep_->limit = new_offset;
+  assert(new_offset >= rep_->limit.load(std::memory_order_relaxed));
+  rep_->limit.store(new_offset, std::memory_order_release);
 }
 
 Status VLogReader::InternalGet(const ReadOptions& option, const Slice& key, void* arg,
@@ -284,7 +452,8 @@ Status VLogReader::InternalGet(const ReadOptions& option, const Slice& key, void
   return s;
 }
 
-bool VLogReader::Validate(uint64_t* offset, uint64_t* num_entries) {
+bool VLogReader::Validate(uint64_t* offset, uint64_t* num_entries,
+                          Status* status) {
   VLogReaderIterator* iter = NewIterator(ReadOptions());
   assert(iter != nullptr);
   *offset = 0;
@@ -295,8 +464,11 @@ bool VLogReader::Validate(uint64_t* offset, uint64_t* num_entries) {
   }
   *offset = iter->current_;
   *num_entries = n;
+  if (status != nullptr) {
+    *status = iter->status();
+  }
   delete iter;
-  return *offset == rep_->limit;
+  return *offset == rep_->limit.load(std::memory_order_acquire);
 }
 
 char* ValueBatch::EncodeKey(char* ptr, const Slice& key) {
@@ -341,12 +513,27 @@ bool ValueBatch::GetVLogRecord(Slice* input, Slice* key, Slice* value) {
 // should be called after SetSequence()
 void ValueBatch::Put(const Slice& key, const Slice& value) {
   assert(!closed);
+  assert(!borrowed_);
   uint32_t off = rep_.size();
   PutVarint32(&rep_, key.size());
   PutVarint32(&rep_, value.size());
   ValueBatch::PutKey(&rep_, key);
   rep_.append(value.data(), value.size());
   handles_.emplace_back(0, 0, off, rep_.size() - off);
+  num_entries++;
+}
+
+void ValueBatch::PutBorrowed(const Slice& key, const Slice& value) {
+  assert(!closed);
+  assert(rep_.empty());
+  borrowed_ = true;
+  const uint32_t off = static_cast<uint32_t>(borrowed_size_);
+  borrowed_size_ += VarintLength(key.size()) + VarintLength(value.size()) +
+                    key.size() + value.size();
+  assert(borrowed_size_ <= std::numeric_limits<uint32_t>::max());
+  borrowed_records_.push_back({key, value});
+  handles_.emplace_back(0, 0, off,
+                        static_cast<uint32_t>(borrowed_size_) - off);
   num_entries++;
 }
 
@@ -366,6 +553,16 @@ class ToWriteBatchHandler : public ValueBatch::Handler {
 Status ValueBatch::ToWriteBatch(WriteBatch* batch) {
   assert(closed);
   assert(num_entries == handles_.size());
+  if (borrowed_) {
+    std::string handle_encoding;
+    for (size_t i = 0; i < borrowed_records_.size(); ++i) {
+      handle_encoding.clear();
+      handles_[i].EncodeTo(&handle_encoding);
+      WriteBatchInternal::Put(batch, borrowed_records_[i].key,
+                              handle_encoding, kTypeValueHandle);
+    }
+    return Status::OK();
+  }
   ToWriteBatchHandler handler;
   handler.batch = batch;
 
@@ -374,6 +571,15 @@ Status ValueBatch::ToWriteBatch(WriteBatch* batch) {
 
 Status ValueBatch::Iterate(ValueBatch::Handler* handler) {
   assert(num_entries == handles_.size());
+  if (borrowed_) {
+    for (size_t i = 0; i < borrowed_records_.size(); ++i) {
+      if (!(*handler)(borrowed_records_[i].key, borrowed_records_[i].value,
+                      handles_[i])) {
+        break;
+      }
+    }
+    return Status::OK();
+  }
   uint32_t found = 0;
   Slice user_key, value;
   std::string handle_encoding;

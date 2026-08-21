@@ -3,8 +3,14 @@
 
 #include "db/blob_vlog_impl.h"
 #include "db/filename.h"
+#include "db/write_batch_internal.h"
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <random>
+#include <set>
 #include <thread>
 #include <unordered_map>
 
@@ -16,6 +22,37 @@
 #include "gtest/gtest.h"
 
 using namespace leveldb;
+
+#ifdef NDEBUG
+#define REQUIRE_TEST_SYNC_POINTS()                                      \
+  GTEST_SKIP() << "sync-point hooks are disabled in release builds"
+#else
+#define REQUIRE_TEST_SYNC_POINTS() \
+  do {                             \
+  } while (false)
+#endif
+
+// SyncPoint is a process-wide singleton. Tests register callbacks with stack
+// arguments, so every exit path (including an ASSERT_* early return) must
+// unregister them before the next test starts.
+class ScopedGCSyncPoints {
+ public:
+  ScopedGCSyncPoints() { Clear(); }
+  ~ScopedGCSyncPoints() { Clear(); }
+
+  ScopedGCSyncPoints(const ScopedGCSyncPoints&) = delete;
+  ScopedGCSyncPoints& operator=(const ScopedGCSyncPoints&) = delete;
+
+ private:
+  static void Clear() {
+    TEST_SYNC_POINT_CLEAR("GC.AfterCollect");
+    TEST_SYNC_POINT_CLEAR("GC.BeforeBackground");
+    TEST_SYNC_POINT_CLEAR("GC.RunGC.InCriticalSection");
+    TEST_SYNC_POINT_CLEAR("GC.Rewrite.AfterBatch");
+    TEST_SYNC_POINT_CLEAR("GC.Rewrite.AfterLSMRewrite");
+    TEST_SYNC_POINT_CLEAR("GC.Rewrite.AfterValueRewrite");
+  }
+};
 
 static void CleanDir(Env* const env, const std::string& dir) {
   std::vector<std::string> fnames;
@@ -39,6 +76,163 @@ uint32_t SizeOfVariant32(uint32_t v) {
 uint64_t SizeOf(const Slice& key, const Slice& val) {
   return SizeOfVariant32(key.size()) + SizeOfVariant32(val.size()) +
          key.size() + val.size();
+}
+
+static std::string IteratorKey(int index) {
+  std::string number = std::to_string(index);
+  return "key" + std::string(4 - number.size(), '0') + number;
+}
+
+static std::string IteratorValue(int index) {
+  return "value-" + std::to_string(index) + std::string(128, 'x');
+}
+
+static void PutIteratorEntries(BlobDB* db, int count) {
+  for (int i = 0; i < count; ++i) {
+    ASSERT_TRUE(
+        db->Put(WriteOptions(), IteratorKey(i), IteratorValue(i)).ok());
+  }
+}
+
+static void ExpectIteratorEntry(Iterator* iter, int index) {
+  ASSERT_TRUE(iter->Valid()) << iter->status().ToString();
+  EXPECT_EQ(IteratorKey(index), iter->key().ToString());
+  EXPECT_EQ(IteratorValue(index), iter->value().ToString());
+}
+
+TEST(VLOG_TEST, DBWrapperPrefetchEmptyIterator) {
+  Options options;
+  options.create_if_missing = true;
+  options.blob_background_read_threads = 2;
+  const std::string dbname("testdb-prefetch-empty");
+  CleanDir(options.env, dbname);
+
+  BlobDB* raw_db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &raw_db).ok());
+  std::unique_ptr<BlobDB> db(raw_db);
+
+  ReadOptions read_options;
+  read_options.blob_prefetch = true;
+  std::unique_ptr<Iterator> iter(db->NewIterator(read_options));
+  EXPECT_FALSE(iter->Valid());
+  EXPECT_TRUE(iter->status().ok());
+
+  iter->SeekToFirst();
+  EXPECT_FALSE(iter->Valid());
+  EXPECT_TRUE(iter->status().ok());
+  iter->SeekToLast();
+  EXPECT_FALSE(iter->Valid());
+  EXPECT_TRUE(iter->status().ok());
+  iter->Seek("key");
+  EXPECT_FALSE(iter->Valid());
+  EXPECT_TRUE(iter->status().ok());
+
+  iter.reset();
+  db.reset();
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, DBWrapperPrefetchLifecycle) {
+  Options options;
+  options.create_if_missing = true;
+  options.blob_value_size_threshold = 16;
+  options.blob_max_file_size = 8 << 20;
+  options.blob_background_read_threads = 3;
+  const std::string dbname("testdb-prefetch-lifecycle");
+  CleanDir(options.env, dbname);
+
+  BlobDB* raw_db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &raw_db).ok());
+  std::unique_ptr<BlobDB> db(raw_db);
+  const int num_entries = 64;
+  PutIteratorEntries(db.get(), num_entries);
+
+  ReadOptions read_options;
+  read_options.blob_prefetch = true;
+  std::unique_ptr<Iterator> iter(db->NewIterator(read_options));
+  EXPECT_FALSE(iter->Valid());
+  EXPECT_TRUE(iter->status().ok());
+
+  // Repeated seeks discard live lookahead. Alternating Next/Prev checks both
+  // direction changes from the same logical entry.
+  for (int round = 0; round < 100; ++round) {
+    const int index = 2 + (round * 17) % (num_entries - 4);
+    iter->Seek(IteratorKey(index));
+    ExpectIteratorEntry(iter.get(), index);
+    iter->Next();
+    ExpectIteratorEntry(iter.get(), index + 1);
+    iter->Prev();
+    ExpectIteratorEntry(iter.get(), index);
+    iter->Prev();
+    ExpectIteratorEntry(iter.get(), index - 1);
+    iter->Next();
+    ExpectIteratorEntry(iter.get(), index);
+  }
+
+  int index = 0;
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next(), ++index) {
+    ExpectIteratorEntry(iter.get(), index);
+  }
+  EXPECT_EQ(num_entries, index);
+  EXPECT_TRUE(iter->status().ok()) << iter->status().ToString();
+
+  index = num_entries - 1;
+  for (iter->SeekToLast(); iter->Valid(); iter->Prev(), --index) {
+    ExpectIteratorEntry(iter.get(), index);
+  }
+  EXPECT_EQ(-1, index);
+  EXPECT_TRUE(iter->status().ok()) << iter->status().ToString();
+
+  iter->Seek("zzzz");
+  EXPECT_FALSE(iter->Valid());
+  iter->SeekToFirst();
+  ExpectIteratorEntry(iter.get(), 0);
+
+  // Destruction must cancel/drain outstanding lookahead without relying on a
+  // detached dispatch thread touching an already-destroyed iterator.
+  iter.reset();
+  iter.reset(db->NewIterator(read_options));
+  iter->SeekToFirst();
+  ExpectIteratorEntry(iter.get(), 0);
+  iter.reset();
+
+  db.reset();
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, DBWrapperPrefetchZeroDepthFallsBack) {
+  Options options;
+  options.create_if_missing = true;
+  options.blob_value_size_threshold = 16;
+  options.blob_background_read_threads = 0;
+  const std::string dbname("testdb-prefetch-zero-depth");
+  CleanDir(options.env, dbname);
+
+  BlobDB* raw_db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &raw_db).ok());
+  std::unique_ptr<BlobDB> db(raw_db);
+  PutIteratorEntries(db.get(), 8);
+
+  ReadOptions read_options;
+  read_options.blob_prefetch = true;
+  std::unique_ptr<Iterator> iter(db->NewIterator(read_options));
+  EXPECT_FALSE(iter->Valid());
+  iter->SeekToFirst();
+  for (int index = 0; index < 8; ++index) {
+    ExpectIteratorEntry(iter.get(), index);
+    if (index + 1 < 8) {
+      iter->Next();
+    }
+  }
+  iter->SeekToLast();
+  ExpectIteratorEntry(iter.get(), 7);
+  iter->Prev();
+  ExpectIteratorEntry(iter.get(), 6);
+  EXPECT_TRUE(iter->status().ok()) << iter->status().ToString();
+
+  iter.reset();
+  db.reset();
+  CleanDir(options.env, dbname);
 }
 
 TEST(VLOG_TEST, DBWrapperPrefetchIter) {
@@ -130,6 +324,8 @@ TEST(VLOG_TEST, DBWrapperPrefetchIter) {
 }
 
 TEST(VLOG_TEST, DBWrapperGC_FailAfterLSMRewrite) {
+  REQUIRE_TEST_SYNC_POINTS();
+  ScopedGCSyncPoints sync_points;
   Options options;
   Status s;
   options.env->NewStdLogger(&options.info_log);
@@ -236,6 +432,8 @@ TEST(VLOG_TEST, DBWrapperGC_FailAfterLSMRewrite) {
 }
 
 TEST(VLOG_TEST, DBWrapperGC_FailAfterValueRewrite) {
+  REQUIRE_TEST_SYNC_POINTS();
+  ScopedGCSyncPoints sync_points;
   Options options;
   Status s;
   options.env->NewStdLogger(&options.info_log);
@@ -350,6 +548,666 @@ TEST(VLOG_TEST, DBWrapperGC_FailAfterValueRewrite) {
   CleanDir(options.env, dbname);
 }
 
+TEST(VLOG_TEST, DBWrapperGCBoundedRewrite) {
+  REQUIRE_TEST_SYNC_POINTS();
+  ScopedGCSyncPoints sync_points;
+  Options options;
+  options.create_if_missing = true;
+  options.blob_max_file_size = 4 << 20;
+  options.blob_value_size_threshold = 256;
+  options.blob_gc_size_discard_threshold = 20;
+  options.blob_gc_num_discard_threshold = 20;
+  options.blob_gc_interval = 0;
+  const std::string dbname("testdb_gc_bounded_rewrite");
+  CleanDir(options.env, dbname);
+
+  std::atomic<int> flushed_batches{0};
+  auto count_batch = +[](void* arg) {
+    reinterpret_cast<std::atomic<int>*>(arg)->fetch_add(
+        1, std::memory_order_relaxed);
+    return false;
+  };
+  TEST_SYNC_POINT_ARG("GC.Rewrite.AfterBatch", &flushed_batches);
+  TEST_SYNC_POINT_CALLBACK("GC.Rewrite.AfterBatch", count_batch);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+
+  constexpr int kEntries = 5000;
+  constexpr int kOverwrites = 1500;
+  const std::string old_value(1024, 'o');
+  const std::string new_value(1024, 'n');
+  for (int i = 0; i < kEntries; ++i) {
+    ASSERT_TRUE(db->Put(WriteOptions(), "key" + std::to_string(i), old_value)
+                    .ok());
+  }
+  for (int i = 0; i < kOverwrites; ++i) {
+    ASSERT_TRUE(db->Put(WriteOptions(), "key" + std::to_string(i), new_value)
+                    .ok());
+  }
+
+  db->ManualGC(0);
+  db->WaitVLogGC();
+  ASSERT_TRUE(db->VLogBGError().ok());
+  // More than one 1 MiB batch proves the rewrite did not retain the complete
+  // live portion of this 4 MiB source file in one ValueBatch.
+  ASSERT_GE(flushed_batches.load(std::memory_order_relaxed), 2);
+
+  std::string value;
+  for (int i = 0; i < kEntries; ++i) {
+    ASSERT_TRUE(db->Get(ReadOptions(), "key" + std::to_string(i), &value).ok());
+    ASSERT_EQ(i < kOverwrites ? new_value : old_value, value);
+  }
+
+  delete db;
+  TEST_SYNC_POINT_CLEAR("GC.Rewrite.AfterBatch");
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, GCReplacementAtMaximumFileNumberCanBeCollected) {
+  Options options;
+  options.create_if_missing = true;
+  options.blob_max_file_size = 2048;
+  options.blob_value_size_threshold = 256;
+  options.blob_gc_size_discard_threshold = 1;
+  options.blob_gc_num_discard_threshold = 1;
+  options.blob_gc_interval = 0;
+  const std::string dbname("testdb_gc_maximum_replacement");
+  CleanDir(options.env, dbname);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+
+  const std::string stale_value(900, 's');
+  const std::string live_value(900, 'l');
+  const std::string rollover_value(900, 'r');
+  ASSERT_TRUE(db->Put(WriteOptions(), "stale", stale_value).ok());
+  ASSERT_TRUE(db->Put(WriteOptions(), "live", live_value).ok());
+  ASSERT_TRUE(db->Put(WriteOptions(), "rollover", rollover_value).ok());
+  ASSERT_TRUE(db->Put(WriteOptions(), "stale", "stale-inline").ok());
+
+  auto list_vlogs = [&]() {
+    std::set<uint64_t> numbers;
+    std::vector<std::string> children;
+    const Status s = options.env->GetChildren(dbname, &children);
+    EXPECT_TRUE(s.ok()) << s.ToString();
+    for (const std::string& child : children) {
+      uint64_t number = 0;
+      FileType type;
+      if (ParseFileName(child, &number, &type) && type == kVLogFile) {
+        numbers.insert(number);
+      }
+    }
+    return numbers;
+  };
+
+  const std::set<uint64_t> before_gc = list_vlogs();
+  ASSERT_GE(before_gc.size(), 2U);
+  const uint64_t source_number = *before_gc.begin();
+  const uint64_t maximum_before_gc = *before_gc.rbegin();
+  ASSERT_LT(source_number, maximum_before_gc);
+
+  // Rewriting the partially stale source allocates a read-only replacement
+  // above the current writable vlog, making the replacement the maximum file
+  // number known to ValueLogImpl.
+  db->ManualGC(source_number);
+  db->WaitVLogGC();
+  ASSERT_TRUE(db->VLogBGError().ok()) << db->VLogBGError().ToString();
+
+  const std::set<uint64_t> after_first_gc = list_vlogs();
+  auto replacement_it = after_first_gc.upper_bound(maximum_before_gc);
+  ASSERT_NE(after_first_gc.end(), replacement_it);
+  const uint64_t replacement_number = *replacement_it;
+  ++replacement_it;
+  ASSERT_EQ(after_first_gc.end(), replacement_it);
+  ASSERT_EQ(replacement_number, *after_first_gc.rbegin());
+  const std::string replacement_name =
+      VLogFileName(dbname, replacement_number);
+  ASSERT_TRUE(options.env->FileExists(replacement_name));
+
+  // An inline overwrite neither appends to nor rolls the current vlog, so the
+  // replacement remains the maximum file number when selected for the next GC.
+  ASSERT_TRUE(db->Put(WriteOptions(), "live", "live-inline").ok());
+  ASSERT_EQ(after_first_gc, list_vlogs());
+
+  db->ManualGC(replacement_number);
+  db->WaitVLogGC();
+  ASSERT_TRUE(db->VLogBGError().ok()) << db->VLogBGError().ToString();
+  EXPECT_FALSE(options.env->FileExists(replacement_name));
+
+  std::string value;
+  ASSERT_TRUE(db->Get(ReadOptions(), "live", &value).ok());
+  EXPECT_EQ("live-inline", value);
+  ASSERT_TRUE(db->Get(ReadOptions(), "rollover", &value).ok());
+  EXPECT_EQ(rollover_value, value);
+
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, DBWrapperRunGCVisitsInitialFilesOnce) {
+  REQUIRE_TEST_SYNC_POINTS();
+  ScopedGCSyncPoints sync_points;
+  Options options;
+  options.create_if_missing = true;
+  options.blob_max_file_size = 64 << 10;
+  options.blob_value_size_threshold = 256;
+  options.blob_gc_size_discard_threshold = 20;
+  options.blob_gc_num_discard_threshold = 20;
+  options.blob_gc_interval = 0;
+  const std::string dbname("testdb_gc_full_pass");
+  CleanDir(options.env, dbname);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  const std::string value(8 << 10, 'v');
+  const std::string new_value(8 << 10, 'n');
+  for (int i = 0; i < 30; ++i) {
+    ASSERT_TRUE(db->Put(WriteOptions(), "key" + std::to_string(i), value).ok());
+  }
+  for (int i = 0; i < 30; i += 2) {
+    ASSERT_TRUE(
+        db->Put(WriteOptions(), "key" + std::to_string(i), new_value).ok());
+  }
+
+  std::vector<std::string> children;
+  ASSERT_TRUE(options.env->GetChildren(dbname, &children).ok());
+  int vlog_files = 0;
+  for (const std::string& child : children) {
+    uint64_t number = 0;
+    FileType type;
+    if (ParseFileName(child, &number, &type) && type == kVLogFile) {
+      ++vlog_files;
+    }
+  }
+  ASSERT_GT(vlog_files, 1);
+  const int expected_sources = vlog_files - 1;  // exclude current writable vlog
+
+  std::atomic<int> background_calls{0};
+  auto count_call = +[](void* arg) {
+    reinterpret_cast<std::atomic<int>*>(arg)->fetch_add(
+        1, std::memory_order_relaxed);
+    return false;
+  };
+  TEST_SYNC_POINT_ARG("GC.BeforeBackground", &background_calls);
+  TEST_SYNC_POINT_CALLBACK("GC.BeforeBackground", count_call);
+
+  // The original source files contain enough overwritten records to create
+  // replacement vlogs. The replacement files must not expand this pass.
+  ASSERT_TRUE(db->RunVLogGC().ok());
+  ASSERT_EQ(expected_sources,
+            background_calls.load(std::memory_order_relaxed));
+
+  std::string result;
+  for (int i = 0; i < 30; ++i) {
+    ASSERT_TRUE(
+        db->Get(ReadOptions(), "key" + std::to_string(i), &result).ok());
+    ASSERT_EQ(i % 2 == 0 ? new_value : value, result);
+  }
+
+  TEST_SYNC_POINT_CLEAR("GC.BeforeBackground");
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, DBWrapperConcurrentRunGCSerializesAndRestartsTimer) {
+  REQUIRE_TEST_SYNC_POINTS();
+  ScopedGCSyncPoints sync_points;
+  Options options;
+  options.create_if_missing = true;
+  options.blob_gc_interval = 1;
+  options.blob_background_read_threads = 0;
+  const std::string dbname("testdb_gc_concurrent_full_pass");
+  CleanDir(options.env, dbname);
+
+  struct RunGCState {
+    std::atomic<int> attempted{0};
+    std::atomic<int> entered{0};
+    std::atomic<int> active{0};
+    std::atomic<int> max_active{0};
+    std::atomic<bool> release{false};
+  } state;
+  auto hold_critical_section = +[](void* arg) {
+    auto* state = reinterpret_cast<RunGCState*>(arg);
+    state->entered.fetch_add(1, std::memory_order_relaxed);
+    const int active =
+        state->active.fetch_add(1, std::memory_order_acq_rel) + 1;
+    int maximum = state->max_active.load(std::memory_order_relaxed);
+    while (maximum < active &&
+           !state->max_active.compare_exchange_weak(
+               maximum, active, std::memory_order_relaxed)) {
+    }
+    while (!state->release.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    state->active.fetch_sub(1, std::memory_order_acq_rel);
+    return false;
+  };
+  TEST_SYNC_POINT_ARG("GC.RunGC.InCriticalSection", &state);
+  TEST_SYNC_POINT_CALLBACK("GC.RunGC.InCriticalSection",
+                           hold_critical_section);
+
+  std::atomic<int> background_calls{0};
+  auto count_background = +[](void* arg) {
+    reinterpret_cast<std::atomic<int>*>(arg)->fetch_add(
+        1, std::memory_order_relaxed);
+    return false;
+  };
+  TEST_SYNC_POINT_ARG("GC.BeforeBackground", &background_calls);
+  TEST_SYNC_POINT_CALLBACK("GC.BeforeBackground", count_background);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+
+  constexpr int kCallers = 8;
+  std::atomic<int> ready{0};
+  std::atomic<bool> start{false};
+  std::vector<Status> statuses(kCallers);
+  std::vector<std::thread> callers;
+  callers.reserve(kCallers);
+  for (int caller = 0; caller < kCallers; ++caller) {
+    callers.emplace_back([&, caller] {
+      ready.fetch_add(1, std::memory_order_release);
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      state.attempted.fetch_add(1, std::memory_order_release);
+      statuses[caller] = db->RunVLogGC();
+    });
+  }
+
+  while (ready.load(std::memory_order_acquire) != kCallers) {
+    std::this_thread::yield();
+  }
+  start.store(true, std::memory_order_release);
+  for (int i = 0;
+       i < 5000 && state.entered.load(std::memory_order_acquire) == 0; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  const bool first_entered =
+      state.entered.load(std::memory_order_acquire) != 0;
+  if (first_entered) {
+    while (state.attempted.load(std::memory_order_acquire) != kCallers) {
+      std::this_thread::yield();
+    }
+    // Keep the first call inside the critical section long enough for every
+    // other caller to contend. They must remain outside the sync point.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(1, state.entered.load(std::memory_order_acquire));
+  }
+  state.release.store(true, std::memory_order_release);
+  for (std::thread& caller : callers) {
+    caller.join();
+  }
+
+  EXPECT_TRUE(first_entered) << "RunVLogGC did not reach its critical section";
+  EXPECT_EQ(1, state.max_active.load(std::memory_order_acquire));
+  EXPECT_EQ(kCallers, state.entered.load(std::memory_order_acquire));
+  for (const Status& status : statuses) {
+    EXPECT_TRUE(status.ok()) << status.ToString();
+  }
+
+  const int calls_before_restart =
+      background_calls.load(std::memory_order_acquire);
+  for (int i = 0;
+       i < 500 && background_calls.load(std::memory_order_acquire) ==
+                      calls_before_restart;
+       ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_GT(background_calls.load(std::memory_order_acquire),
+            calls_before_restart)
+      << "periodic GC timer did not restart after concurrent RunVLogGC calls";
+
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, DBWrapperManualGCQueuesDistinctFiles) {
+  REQUIRE_TEST_SYNC_POINTS();
+  ScopedGCSyncPoints sync_points;
+  Options options;
+  options.create_if_missing = true;
+  options.blob_max_file_size = 32 << 10;
+  options.blob_value_size_threshold = 256;
+  options.blob_gc_size_discard_threshold = 100;
+  options.blob_gc_num_discard_threshold = 100;
+  options.blob_gc_interval = 0;
+  const std::string dbname("testdb_gc_manual_queue");
+  CleanDir(options.env, dbname);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  const std::string value(8 << 10, 'v');
+  for (int i = 0; i < 24; ++i) {
+    ASSERT_TRUE(db->Put(WriteOptions(), "key" + std::to_string(i), value).ok());
+  }
+
+  std::vector<std::string> children;
+  ASSERT_TRUE(options.env->GetChildren(dbname, &children).ok());
+  std::set<uint64_t> file_numbers;
+  for (const std::string& child : children) {
+    uint64_t number = 0;
+    FileType type;
+    if (ParseFileName(child, &number, &type) && type == kVLogFile) {
+      file_numbers.insert(number);
+    }
+  }
+  // The largest vlog is the current writable file; choose three read-only
+  // files so each request maps to a distinct eligible source.
+  ASSERT_GE(file_numbers.size(), 4U);
+  auto current = file_numbers.end();
+  --current;
+  file_numbers.erase(current);
+  auto source = file_numbers.begin();
+  const uint64_t first = *source++;
+  const uint64_t second = *source++;
+  const uint64_t third = *source++;
+
+  struct BlockingGC {
+    std::atomic<int> calls{0};
+    std::atomic<bool> first_entered{false};
+    std::atomic<bool> release_first{false};
+  } state;
+  auto block_first = +[](void* arg) {
+    auto* state = reinterpret_cast<BlockingGC*>(arg);
+    const int previous = state->calls.fetch_add(1, std::memory_order_relaxed);
+    if (previous == 0) {
+      state->first_entered.store(true, std::memory_order_release);
+      while (!state->release_first.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+    }
+    return false;
+  };
+  TEST_SYNC_POINT_ARG("GC.BeforeBackground", &state);
+  TEST_SYNC_POINT_CALLBACK("GC.BeforeBackground", block_first);
+
+  db->ManualGC(first);
+  for (int i = 0;
+       i < 5000 && !state.first_entered.load(std::memory_order_acquire); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_TRUE(state.first_entered.load(std::memory_order_acquire));
+
+  // Queue two requests while the first scheduled job is blocked. A single
+  // boolean/file slot loses the first two requests by repeatedly overwriting
+  // it; a coalescing set drains all three in separate jobs.
+  db->ManualGC(second);
+  db->ManualGC(third);
+  state.release_first.store(true, std::memory_order_release);
+  db->WaitVLogGC();
+
+  EXPECT_EQ(3, state.calls.load(std::memory_order_relaxed));
+  TEST_SYNC_POINT_CLEAR("GC.BeforeBackground");
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, DBWrapperGCDefersUnpublishedRolledFile) {
+  REQUIRE_TEST_SYNC_POINTS();
+  ScopedGCSyncPoints sync_points;
+  Options options;
+  options.create_if_missing = true;
+  options.blob_max_file_size = 4 << 10;
+  options.blob_value_size_threshold = 1;
+  options.blob_gc_size_discard_threshold = 100;
+  options.blob_gc_num_discard_threshold = 100;
+  options.blob_gc_interval = 0;
+  const std::string dbname("testdb_gc_publication_pin");
+  CleanDir(options.env, dbname);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+
+  class BlockingWriteCallback : public WriteCallback {
+   public:
+    Status Callback(DB*) override {
+      entered.store(true, std::memory_order_release);
+      while (!release.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      return Status::OK();
+    }
+
+    bool AllowGrouping() const override { return false; }
+
+    std::atomic<bool> entered{false};
+    std::atomic<bool> release{false};
+  } callback;
+
+  const std::string key("pinned-key");
+  const std::string expected(8 << 10, 'p');
+  WriteBatch batch;
+  batch.Put(key, expected);
+  Status write_status;
+  std::thread writer([&] {
+    write_status = db->Write(WriteOptions(), &batch, &callback);
+  });
+
+  for (int i = 0;
+       i < 5000 && !callback.entered.load(std::memory_order_acquire); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  if (!callback.entered.load(std::memory_order_acquire)) {
+    callback.release.store(true, std::memory_order_release);
+    writer.join();
+    ADD_FAILURE() << "write callback did not start";
+    delete db;
+    CleanDir(options.env, dbname);
+    return;
+  }
+
+  // The oversized write has rolled its vlog, but its callback is deliberately
+  // holding the LSM publication. The smaller file number is that read-only,
+  // publication-pinned source; the larger one is the new writable vlog.
+  std::vector<std::string> children;
+  Status children_status = options.env->GetChildren(dbname, &children);
+  if (!children_status.ok()) {
+    callback.release.store(true, std::memory_order_release);
+    writer.join();
+    ADD_FAILURE() << children_status.ToString();
+    delete db;
+    CleanDir(options.env, dbname);
+    return;
+  }
+  std::set<uint64_t> file_numbers;
+  for (const std::string& child : children) {
+    uint64_t number = 0;
+    FileType type;
+    if (ParseFileName(child, &number, &type) && type == kVLogFile) {
+      file_numbers.insert(number);
+    }
+  }
+  if (file_numbers.size() < 2U) {
+    callback.release.store(true, std::memory_order_release);
+    writer.join();
+    ADD_FAILURE() << "oversized write did not roll its vlog";
+    delete db;
+    CleanDir(options.env, dbname);
+    return;
+  }
+  const uint64_t source_number = *file_numbers.begin();
+  const std::string source_name = VLogFileName(dbname, source_number);
+
+  std::atomic<int> background_calls{0};
+  auto count_call = +[](void* arg) {
+    reinterpret_cast<std::atomic<int>*>(arg)->fetch_add(
+        1, std::memory_order_relaxed);
+    return false;
+  };
+  TEST_SYNC_POINT_ARG("GC.BeforeBackground", &background_calls);
+  TEST_SYNC_POINT_CALLBACK("GC.BeforeBackground", count_call);
+
+  Status gc_status = db->RunVLogGC();
+  EXPECT_TRUE(gc_status.ok()) << gc_status.ToString();
+  // A full pass filters pinned sources before scheduling background work.
+  EXPECT_EQ(0, background_calls.load(std::memory_order_relaxed));
+  EXPECT_TRUE(options.env->FileExists(source_name));
+
+  // Publishing the handle releases the pin and automatically retries the
+  // deferred request. The retry sees a live value and must retain the source.
+  callback.release.store(true, std::memory_order_release);
+  writer.join();
+  EXPECT_TRUE(write_status.ok()) << write_status.ToString();
+  db->WaitVLogGC();
+  EXPECT_EQ(1, background_calls.load(std::memory_order_relaxed));
+  EXPECT_TRUE(options.env->FileExists(source_name));
+
+  std::string actual;
+  Status get_status = db->Get(ReadOptions(), key, &actual);
+  EXPECT_TRUE(get_status.ok()) << get_status.ToString();
+  if (get_status.ok()) {
+    EXPECT_EQ(expected, actual);
+  }
+
+  TEST_SYNC_POINT_CLEAR("GC.BeforeBackground");
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, DBWrapperEmptyGCDoesNotBusyReschedule) {
+  REQUIRE_TEST_SYNC_POINTS();
+  ScopedGCSyncPoints sync_points;
+  Options options;
+  options.create_if_missing = true;
+  options.blob_gc_interval = 1;
+  const std::string dbname("testdb_gc_empty_schedule");
+  CleanDir(options.env, dbname);
+
+  std::atomic<int> background_calls{0};
+  auto count_and_delay_first = +[](void* arg) {
+    auto* calls = reinterpret_cast<std::atomic<int>*>(arg);
+    const int previous = calls->fetch_add(1, std::memory_order_relaxed);
+    if (previous == 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    }
+    return false;
+  };
+  TEST_SYNC_POINT_ARG("GC.BeforeBackground", &background_calls);
+  TEST_SYNC_POINT_CALLBACK("GC.BeforeBackground", count_and_delay_first);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  db->ManualGC(0);
+  db->WaitVLogGC();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+  // The first empty scan takes longer than blob_gc_interval. The old scheduler
+  // left gc_last_run_ unchanged and immediately requeued an unbounded stream
+  // of empty scans when BGCall returned.
+  ASSERT_EQ(1, background_calls.load(std::memory_order_relaxed));
+  ASSERT_TRUE(db->VLogBGError().ok());
+
+  delete db;
+  TEST_SYNC_POINT_CLEAR("GC.BeforeBackground");
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, DBWrapperPeriodicGCWithoutForegroundRollover) {
+  REQUIRE_TEST_SYNC_POINTS();
+  ScopedGCSyncPoints sync_points;
+  Options options;
+  options.create_if_missing = true;
+  options.blob_gc_interval = 1;
+  const std::string dbname("testdb_gc_periodic_idle");
+  CleanDir(options.env, dbname);
+
+  std::atomic<int> background_calls{0};
+  auto count_call = +[](void* arg) {
+    reinterpret_cast<std::atomic<int>*>(arg)->fetch_add(
+        1, std::memory_order_relaxed);
+    return false;
+  };
+  TEST_SYNC_POINT_ARG("GC.BeforeBackground", &background_calls);
+  TEST_SYNC_POINT_CALLBACK("GC.BeforeBackground", count_call);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  // No write, rollover, or manual GC call occurs after Open. The dedicated
+  // timer must be the event which starts this empty maintenance pass.
+  for (int i = 0;
+       i < 500 && background_calls.load(std::memory_order_relaxed) == 0; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_GE(background_calls.load(std::memory_order_relaxed), 1);
+
+  delete db;
+  TEST_SYNC_POINT_CLEAR("GC.BeforeBackground");
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, DBWrapperGCRemovesObsoleteFileAfterSnapshotRelease) {
+  Options options;
+  options.create_if_missing = true;
+  options.blob_max_file_size = 64 << 10;
+  options.blob_value_size_threshold = 256;
+  options.blob_gc_size_discard_threshold = 1;
+  options.blob_gc_num_discard_threshold = 1;
+  options.blob_gc_interval = 1;
+  const std::string dbname("testdb_gc_obsolete_lifecycle");
+  CleanDir(options.env, dbname);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  const std::string old_value(8 << 10, 'o');
+  const std::string new_value(8 << 10, 'n');
+  constexpr int kEntries = 12;
+  for (int i = 0; i < kEntries; ++i) {
+    ASSERT_TRUE(db->Put(WriteOptions(), "key" + std::to_string(i), old_value)
+                    .ok());
+  }
+
+  std::vector<std::string> children;
+  ASSERT_TRUE(options.env->GetChildren(dbname, &children).ok());
+  uint64_t source_number = 0;
+  for (const std::string& child : children) {
+    uint64_t number = 0;
+    FileType type;
+    if (ParseFileName(child, &number, &type) && type == kVLogFile &&
+        (source_number == 0 || number < source_number)) {
+      source_number = number;
+    }
+  }
+  ASSERT_NE(0, source_number);
+  const std::string source_name = VLogFileName(dbname, source_number);
+
+  const Snapshot* snapshot = db->GetSnapshot();
+  for (int i = 0; i < kEntries; ++i) {
+    ASSERT_TRUE(db->Put(WriteOptions(), "key" + std::to_string(i), new_value)
+                    .ok());
+  }
+
+  db->ManualGC(source_number);
+  db->WaitVLogGC();
+  ASSERT_TRUE(db->VLogBGError().ok());
+  ASSERT_TRUE(options.env->FileExists(source_name));
+
+  ReadOptions snapshot_read;
+  snapshot_read.snapshot = snapshot;
+  std::string value;
+  ASSERT_TRUE(db->Get(snapshot_read, "key0", &value).ok());
+  ASSERT_EQ(old_value, value);
+
+  db->ReleaseSnapshot(snapshot);
+  // No foreground write or explicit RemoveObsoleteBlob() call follows the
+  // release. A timer-driven maintenance pass must notice that the snapshot
+  // barrier has expired and reclaim the old file.
+  for (int i = 0; i < 500 && options.env->FileExists(source_name); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_FALSE(options.env->FileExists(source_name));
+
+  for (int i = 0; i < kEntries; ++i) {
+    ASSERT_TRUE(db->Get(ReadOptions(), "key" + std::to_string(i), &value).ok());
+    ASSERT_EQ(new_value, value);
+  }
+
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
 TEST(VLOG_TEST, DBWrapperAutoGC) {
   Options options;
   Status s;
@@ -442,6 +1300,7 @@ TEST(VLOG_TEST, DBWrapperAutoGC) {
 }
 
 TEST(VLOG_TEST, DBWrapperGCAsync) {
+  ScopedGCSyncPoints sync_points;
   Options options;
   Status s;
   options.env->NewStdLogger(&options.info_log);
@@ -563,6 +1422,7 @@ TEST(VLOG_TEST, DBWrapperGCAsync) {
 }
 
 TEST(VLOG_TEST, DBWrapperGCOverwriteAfterCollect) {
+  ScopedGCSyncPoints sync_points;
   Options options;
   Status s;
   options.env->NewStdLogger(&options.info_log);
@@ -695,6 +1555,7 @@ TEST(VLOG_TEST, DBWrapperGCOverwriteAfterCollect) {
 }
 
 TEST(VLOG_TEST, DBWrapperManualGCSync) {
+  ScopedGCSyncPoints sync_points;
   Options options;
   Status s;
   options.env->NewStdLogger(&options.info_log);
@@ -804,6 +1665,251 @@ TEST(VLOG_TEST, DBWrapperManualGCSync) {
   CleanDir(options.env, dbname);
 }
 
+namespace {
+
+// Blocks one WAL append before it reaches the underlying WritableFile. This
+// makes it possible to verify that DBImpl::Sync joins the writer queue instead
+// of concurrently invoking Sync on a single-threaded WritableFile.
+class BlockingLogEnv : public EnvWrapper {
+ public:
+  explicit BlockingLogEnv(Env* target) : EnvWrapper(target) {}
+
+  Status NewWritableFile(const std::string& filename,
+                         WritableFile** result) override {
+    WritableFile* target_file = nullptr;
+    Status s = target()->NewWritableFile(filename, &target_file);
+    if (!s.ok()) {
+      *result = nullptr;
+      return s;
+    }
+
+    const std::string::size_type separator = filename.rfind('/');
+    const std::string::size_type basename =
+        separator == std::string::npos ? 0 : separator + 1;
+    constexpr char kVLogManifestPrefix[] = "VLOG-MANIFEST-";
+    if (filename.compare(basename, sizeof(kVLogManifestPrefix) - 1,
+                         kVLogManifestPrefix) == 0) {
+      *result = new ManifestFile(this, target_file);
+    } else if (filename.size() >= 4 &&
+        filename.compare(filename.size() - 4, 4, ".log") == 0) {
+      log_file_creations_.fetch_add(1, std::memory_order_relaxed);
+      *result = new LogFile(this, target_file);
+    } else if (filename.size() >= 4 &&
+               filename.compare(filename.size() - 4, 4, ".ldb") == 0) {
+      *result = new TableFile(this, target_file);
+    } else {
+      *result = target_file;
+    }
+    return Status::OK();
+  }
+
+  void BlockNextLogAppend() {
+    append_blocked_.store(false, std::memory_order_release);
+    release_append_.store(false, std::memory_order_release);
+    sync_during_append_.store(false, std::memory_order_release);
+    block_next_append_.store(true, std::memory_order_release);
+  }
+
+  void WaitForBlockedLogAppend() {
+    while (!append_blocked_.load(std::memory_order_acquire)) {
+      target()->SleepForMicroseconds(100);
+    }
+  }
+
+  void ReleaseLogAppend() {
+    release_append_.store(true, std::memory_order_release);
+  }
+
+  bool SyncDuringBlockedAppend() const {
+    return sync_during_append_.load(std::memory_order_acquire);
+  }
+
+  void FailNextLogSync() {
+    fail_next_sync_.store(true, std::memory_order_release);
+  }
+
+  void FailLogAppendAfterSuccessOnCall(int call) {
+    fail_append_as_invalid_argument_.store(false, std::memory_order_release);
+    fail_append_countdown_.store(call, std::memory_order_release);
+  }
+
+  void FailLogAppendAfterSuccessWithInvalidArgumentOnCall(int call) {
+    fail_append_as_invalid_argument_.store(true, std::memory_order_release);
+    fail_append_countdown_.store(call, std::memory_order_release);
+  }
+
+  void FailNextVLogManifestSyncAfterSuccess() {
+    fail_next_manifest_sync_.store(true, std::memory_order_release);
+  }
+
+  void BlockTableSync() {
+    table_sync_blocked_.store(false, std::memory_order_release);
+    release_table_sync_.store(false, std::memory_order_release);
+    block_table_sync_.store(true, std::memory_order_release);
+  }
+
+  void WaitForBlockedTableSync() {
+    while (!table_sync_blocked_.load(std::memory_order_acquire)) {
+      target()->SleepForMicroseconds(100);
+    }
+  }
+
+  void ReleaseTableSync() {
+    release_table_sync_.store(true, std::memory_order_release);
+  }
+
+  int LogFileCreations() const {
+    return log_file_creations_.load(std::memory_order_acquire);
+  }
+
+  bool ClosedDirtyLog() const {
+    return closed_dirty_log_.load(std::memory_order_acquire);
+  }
+
+ private:
+  class ManifestFile : public WritableFile {
+   public:
+    ManifestFile(BlockingLogEnv* env, WritableFile* target)
+        : env_(env), target_(target) {}
+    ~ManifestFile() override { delete target_; }
+
+    Status Append(const Slice& data) override { return target_->Append(data); }
+    Status Close() override { return target_->Close(); }
+    Status Flush() override { return target_->Flush(); }
+    Status Sync() override {
+      Status s = target_->Sync();
+      if (s.ok() && env_->fail_next_manifest_sync_.exchange(
+                        false, std::memory_order_acq_rel)) {
+        return Status::IOError(
+            "injected vlog manifest sync error after persistence");
+      }
+      return s;
+    }
+
+   private:
+    BlockingLogEnv* const env_;
+    WritableFile* const target_;
+  };
+
+  class LogFile : public WritableFile {
+   public:
+    LogFile(BlockingLogEnv* env, WritableFile* target)
+        : env_(env), target_(target) {}
+    ~LogFile() override { delete target_; }
+
+    Status Append(const Slice& data) override {
+      if (env_->block_next_append_.exchange(false,
+                                             std::memory_order_acq_rel)) {
+        env_->append_blocked_.store(true, std::memory_order_release);
+        while (!env_->release_append_.load(std::memory_order_acquire)) {
+          env_->target()->SleepForMicroseconds(100);
+        }
+        env_->append_blocked_.store(false, std::memory_order_release);
+      }
+      Status s = target_->Append(data);
+      if (s.ok()) {
+        dirty_.store(true, std::memory_order_release);
+        const int countdown =
+            env_->fail_append_countdown_.load(std::memory_order_acquire);
+        if (countdown > 0 &&
+            env_->fail_append_countdown_.fetch_sub(
+                1, std::memory_order_acq_rel) == 1) {
+          Status flushed = target_->Flush();
+          if (!flushed.ok()) return flushed;
+          if (env_->fail_append_as_invalid_argument_.exchange(
+                  false, std::memory_order_acq_rel)) {
+            return Status::InvalidArgument(
+                "injected non-IO WAL append error after write");
+          }
+          return Status::IOError("injected WAL append error after write");
+        }
+      }
+      return s;
+    }
+
+    Status Close() override {
+      if (dirty_.load(std::memory_order_acquire)) {
+        env_->closed_dirty_log_.store(true, std::memory_order_release);
+      }
+      return target_->Close();
+    }
+    Status Flush() override { return target_->Flush(); }
+
+    Status Sync() override {
+      if (env_->append_blocked_.load(std::memory_order_acquire)) {
+        env_->sync_during_append_.store(true, std::memory_order_release);
+        // Do not invoke the underlying single-threaded file concurrently.
+        return Status::OK();
+      }
+      if (env_->fail_next_sync_.exchange(false,
+                                         std::memory_order_acq_rel)) {
+        Status persisted = target_->Sync();
+        if (!persisted.ok()) return persisted;
+        dirty_.store(false, std::memory_order_release);
+        return Status::IOError("injected WAL sync error after persistence");
+      }
+      Status s = target_->Sync();
+      if (s.ok()) {
+        dirty_.store(false, std::memory_order_release);
+      }
+      return s;
+    }
+
+   private:
+    BlockingLogEnv* const env_;
+    WritableFile* const target_;
+    std::atomic<bool> dirty_{false};
+  };
+
+  class TableFile : public WritableFile {
+   public:
+    TableFile(BlockingLogEnv* env, WritableFile* target)
+        : env_(env), target_(target) {}
+    ~TableFile() override { delete target_; }
+
+    Status Append(const Slice& data) override { return target_->Append(data); }
+    Status Close() override { return target_->Close(); }
+    Status Flush() override { return target_->Flush(); }
+    Status Sync() override {
+      if (env_->block_table_sync_.exchange(false,
+                                            std::memory_order_acq_rel)) {
+        env_->table_sync_blocked_.store(true, std::memory_order_release);
+        while (!env_->release_table_sync_.load(std::memory_order_acquire)) {
+          env_->target()->SleepForMicroseconds(100);
+        }
+        env_->table_sync_blocked_.store(false, std::memory_order_release);
+      }
+      return target_->Sync();
+    }
+
+   private:
+    BlockingLogEnv* const env_;
+    WritableFile* const target_;
+  };
+
+  std::atomic<bool> block_next_append_{false};
+  std::atomic<bool> append_blocked_{false};
+  std::atomic<bool> release_append_{false};
+  std::atomic<bool> sync_during_append_{false};
+  std::atomic<int> log_file_creations_{0};
+  std::atomic<bool> closed_dirty_log_{false};
+  std::atomic<bool> fail_next_sync_{false};
+  std::atomic<bool> fail_next_manifest_sync_{false};
+  std::atomic<int> fail_append_countdown_{0};
+  std::atomic<bool> fail_append_as_invalid_argument_{false};
+  std::atomic<bool> block_table_sync_{false};
+  std::atomic<bool> table_sync_blocked_{false};
+  std::atomic<bool> release_table_sync_{false};
+};
+
+void WaitForWriterQueueSize(DBImpl* db, size_t expected) {
+  while (db->TEST_WriterQueueSize() < expected) {
+    Env::Default()->SleepForMicroseconds(100);
+  }
+}
+
+}  // namespace
+
 TEST(DBIMPL_TEST, WriteCallback) {
   Options options;
   Status s;
@@ -833,18 +1939,20 @@ TEST(DBIMPL_TEST, WriteCallback) {
 
   wb.Put("key1", "val1");
   s = db->Write(WriteOptions(), &wb, &cb);
-  ASSERT_TRUE(s.ok());
+  ASSERT_TRUE(s.IsNotFound());
 
   s = db->Get(ReadOptions(), "key1", &value);
   ASSERT_TRUE(s.IsNotFound());
 
   db->Put(WriteOptions(), "key0", "val0");
   s = db->Write(WriteOptions(), &wb, &cb);
+  ASSERT_TRUE(s.ok());
   s = db->Get(ReadOptions(), "key1", &value);
   ASSERT_TRUE(s.ok());
   ASSERT_EQ(value, "val1");
 
   delete db;
+  CleanDir(options.env, dbname);
 }
 
 TEST(DBIMPL_TEST, BuildWriterGroup) {
@@ -864,6 +1972,550 @@ TEST(DBIMPL_TEST, BuildWriterGroup) {
   dbImpl->TEST_BuildWriterGroup();
 
   delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(DBIMPL_TEST, SyncWaitsForActiveLogAppend) {
+  BlockingLogEnv env(Env::Default());
+  Options options;
+  options.env = &env;
+  options.create_if_missing = true;
+  const std::string dbname("testdb-dbimpl-sync-barrier");
+  CleanDir(options.env, dbname);
+
+  DB* db = nullptr;
+  ASSERT_TRUE(DB::Open(options, dbname, &db).ok());
+  ASSERT_NE(nullptr, db);
+  DBImpl* db_impl = static_cast<DBImpl*>(db);
+
+  env.BlockNextLogAppend();
+  Status write_status;
+  Status sync_status;
+  std::atomic<bool> sync_started{false};
+  std::atomic<bool> sync_done{false};
+
+  std::thread writer([&] {
+    write_status = db->Put(WriteOptions(), "key", "value");
+  });
+  env.WaitForBlockedLogAppend();
+
+  std::thread syncer([&] {
+    sync_started.store(true, std::memory_order_release);
+    sync_status = db_impl->Sync();
+    sync_done.store(true, std::memory_order_release);
+  });
+  while (!sync_started.load(std::memory_order_acquire)) {
+    options.env->SleepForMicroseconds(100);
+  }
+
+  size_t queue_size = db_impl->TEST_WriterQueueSize();
+  while (queue_size < 2 && !sync_done.load(std::memory_order_acquire)) {
+    options.env->SleepForMicroseconds(100);
+    queue_size = db_impl->TEST_WriterQueueSize();
+  }
+
+  EXPECT_GE(queue_size, 2U);
+  EXPECT_FALSE(sync_done.load(std::memory_order_acquire));
+  EXPECT_FALSE(env.SyncDuringBlockedAppend());
+
+  env.ReleaseLogAppend();
+  writer.join();
+  syncer.join();
+
+  EXPECT_TRUE(write_status.ok()) << write_status.ToString();
+  EXPECT_TRUE(sync_status.ok()) << sync_status.ToString();
+  EXPECT_FALSE(env.SyncDuringBlockedAppend());
+
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(DBIMPL_TEST, SyncDoesNotRotateUnsyncedWAL) {
+  BlockingLogEnv env(Env::Default());
+  Options options;
+  options.env = &env;
+  options.create_if_missing = true;
+  options.write_buffer_size = 64 << 10;
+  const std::string dbname("testdb-dbimpl-sync-no-rotate");
+  CleanDir(options.env, dbname);
+
+  DB* db = nullptr;
+  ASSERT_TRUE(DB::Open(options, dbname, &db).ok());
+  ASSERT_NE(nullptr, db);
+  DBImpl* db_impl = static_cast<DBImpl*>(db);
+
+  ASSERT_TRUE(
+      db->Put(WriteOptions(), "large", std::string(128 << 10, 'x')).ok());
+  const int logs_before_sync = env.LogFileCreations();
+  ASSERT_EQ(1, logs_before_sync);
+
+  Status s = db_impl->Sync();
+  EXPECT_TRUE(s.ok()) << s.ToString();
+  EXPECT_EQ(logs_before_sync, env.LogFileCreations());
+  EXPECT_FALSE(env.ClosedDirtyLog());
+
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(DBIMPL_TEST, SyncWaitsForRetiredWALFlush) {
+  BlockingLogEnv env(Env::Default());
+  Options options;
+  options.env = &env;
+  options.create_if_missing = true;
+  options.write_buffer_size = 64 << 10;
+  const std::string dbname("testdb-dbimpl-sync-retired-wal");
+  CleanDir(options.env, dbname);
+
+  DB* db = nullptr;
+  ASSERT_TRUE(DB::Open(options, dbname, &db).ok());
+  ASSERT_NE(nullptr, db);
+  DBImpl* db_impl = static_cast<DBImpl*>(db);
+  ASSERT_TRUE(
+      db->Put(WriteOptions(), "large", std::string(128 << 10, 'x')).ok());
+
+  env.BlockTableSync();
+  ASSERT_TRUE(db->Put(WriteOptions(), "rotate", "value").ok());
+  env.WaitForBlockedTableSync();
+
+  Status sync_status;
+  std::atomic<bool> sync_done{false};
+  std::thread syncer([&] {
+    sync_status = db_impl->Sync();
+    sync_done.store(true, std::memory_order_release);
+  });
+  while (db_impl->TEST_WriterQueueSize() == 0) {
+    options.env->SleepForMicroseconds(100);
+  }
+  EXPECT_FALSE(sync_done.load(std::memory_order_acquire));
+
+  env.ReleaseTableSync();
+  syncer.join();
+  EXPECT_TRUE(sync_status.ok()) << sync_status.ToString();
+
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(DBIMPL_TEST, SyncWriteWaitsForRetiredWALFlush) {
+  BlockingLogEnv env(Env::Default());
+  Options options;
+  options.env = &env;
+  options.create_if_missing = true;
+  options.write_buffer_size = 64 << 10;
+  const std::string dbname("testdb-dbimpl-sync-write-retired-wal");
+  CleanDir(options.env, dbname);
+
+  DB* db = nullptr;
+  ASSERT_TRUE(DB::Open(options, dbname, &db).ok());
+  ASSERT_NE(nullptr, db);
+  ASSERT_TRUE(
+      db->Put(WriteOptions(), "large", std::string(128 << 10, 'x')).ok());
+
+  env.BlockTableSync();
+  WriteOptions durable;
+  durable.sync = true;
+  Status write_status;
+  std::atomic<bool> write_done{false};
+  std::thread writer([&] {
+    write_status = db->Put(durable, "sync", "value");
+    write_done.store(true, std::memory_order_release);
+  });
+  env.WaitForBlockedTableSync();
+  EXPECT_FALSE(write_done.load(std::memory_order_acquire));
+
+  env.ReleaseTableSync();
+  writer.join();
+  EXPECT_TRUE(write_status.ok()) << write_status.ToString();
+
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, AllStaleGCRequiresSuccessfulLSMSync) {
+  BlockingLogEnv env(Env::Default());
+  Options options;
+  options.env = &env;
+  options.create_if_missing = true;
+  options.blob_value_size_threshold = 1;
+  options.blob_max_file_size = 2048;
+  options.blob_gc_interval = 0;
+  const std::string dbname("testdb-gc-all-stale-sync");
+  CleanDir(options.env, dbname);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  WriteOptions durable;
+  durable.sync = true;
+  ASSERT_TRUE(db->Put(durable, "a", std::string(1100, 'a')).ok());
+  ASSERT_TRUE(db->Put(durable, "b", std::string(1100, 'b')).ok());
+  const std::string source = VLogFileName(dbname, 3);
+  ASSERT_TRUE(options.env->FileExists(source));
+
+  ASSERT_TRUE(db->Put(WriteOptions(), "a", "new-a").ok());
+  ASSERT_TRUE(db->Put(WriteOptions(), "b", "new-b").ok());
+  env.FailNextLogSync();
+  db->ManualGC(3);
+  db->WaitVLogGC();
+
+  EXPECT_TRUE(db->VLogBGError().IsIOError())
+      << db->VLogBGError().ToString();
+  EXPECT_TRUE(options.env->FileExists(source));
+
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, BecameStaleGCRequiresSuccessfulLSMSync) {
+  REQUIRE_TEST_SYNC_POINTS();
+  ScopedGCSyncPoints sync_points;
+  BlockingLogEnv env(Env::Default());
+  Options options;
+  options.env = &env;
+  options.create_if_missing = true;
+  options.blob_value_size_threshold = 1;
+  // Keep both candidates in vlog #3, then force it read-only with a third
+  // record. The GC initially collects b, only for the sync-point overwrite
+  // below to make that last copied entry stale before Rewrite().
+  options.blob_max_file_size = 2500;
+  options.blob_gc_interval = 0;
+  const std::string dbname("testdb-gc-became-stale-sync");
+  CleanDir(options.env, dbname);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  WriteOptions durable;
+  durable.sync = true;
+  ASSERT_TRUE(db->Put(durable, "a", std::string(1100, 'a')).ok());
+  ASSERT_TRUE(db->Put(durable, "b", std::string(1100, 'b')).ok());
+  ASSERT_TRUE(
+      db->Put(durable, "rollover", std::string(1100, 'r')).ok());
+  const std::string source = VLogFileName(dbname, 3);
+  ASSERT_TRUE(options.env->FileExists(source));
+  ASSERT_TRUE(db->Put(WriteOptions(), "a", "new-a").ok());
+
+  struct OverwriteArg {
+    BlobDB* db;
+    Status status;
+  } overwrite{db, Status::OK()};
+  auto overwrite_remaining = +[](void* raw) {
+    auto* arg = reinterpret_cast<OverwriteArg*>(raw);
+    arg->status = arg->db->Put(WriteOptions(), "b", "new-b");
+    return false;
+  };
+  TEST_SYNC_POINT_ARG("GC.AfterCollect", &overwrite);
+  TEST_SYNC_POINT_CALLBACK("GC.AfterCollect", overwrite_remaining);
+
+  env.FailNextLogSync();
+  db->ManualGC(3);
+  db->WaitVLogGC();
+
+  EXPECT_TRUE(overwrite.status.ok()) << overwrite.status.ToString();
+  EXPECT_TRUE(db->VLogBGError().IsIOError())
+      << db->VLogBGError().ToString();
+  EXPECT_TRUE(options.env->FileExists(source));
+
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, IndeterminateLSMAppendKeepsPublicationPin) {
+  BlockingLogEnv env(Env::Default());
+  Options options;
+  options.env = &env;
+  options.create_if_missing = true;
+  options.blob_value_size_threshold = 1;
+  options.blob_max_file_size = 512;
+  options.blob_gc_interval = 0;
+  const std::string dbname("testdb-indeterminate-publication");
+  CleanDir(options.env, dbname);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  env.FailLogAppendAfterSuccessOnCall(2);
+  Status s = db->Put(WriteOptions(), "key", std::string(1100, 'v'));
+  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+
+  const std::string source = VLogFileName(dbname, 3);
+  ASSERT_TRUE(options.env->FileExists(source));
+  db->ManualGC(3);
+  db->WaitVLogGC();
+  EXPECT_TRUE(db->VLogBGError().ok()) << db->VLogBGError().ToString();
+  db->RemoveObsoleteBlob();
+  EXPECT_TRUE(options.env->FileExists(source));
+
+  delete db;
+  db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  std::string value;
+  ASSERT_TRUE(db->Get(ReadOptions(), "key", &value).ok());
+  EXPECT_EQ(std::string(1100, 'v'), value);
+
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, CallbackIOErrorReleasesUnpublishedVLogPin) {
+  BlockingLogEnv env(Env::Default());
+  Options options;
+  options.env = &env;
+  options.create_if_missing = true;
+  options.blob_value_size_threshold = 1;
+  options.blob_max_file_size = 512;
+  options.blob_gc_interval = 0;
+  const std::string dbname("testdb-callback-error-publication");
+  CleanDir(options.env, dbname);
+
+  class RejectBeforeWAL : public WriteCallback {
+   public:
+    Status Callback(DB*) override {
+      return Status::IOError("injected callback rejection");
+    }
+    bool AllowGrouping() const override { return false; }
+  } callback;
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  WriteBatch batch;
+  batch.Put("key", std::string(1100, 'v'));
+  Status s = db->Write(WriteOptions(), &batch, &callback);
+  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+
+  const std::string unpublished_vlog = VLogFileName(dbname, 3);
+  ASSERT_TRUE(options.env->FileExists(unpublished_vlog));
+  db->ManualGC(3);
+  db->WaitVLogGC();
+  EXPECT_TRUE(db->VLogBGError().ok()) << db->VLogBGError().ToString();
+  db->RemoveObsoleteBlob();
+  EXPECT_FALSE(options.env->FileExists(unpublished_vlog));
+
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, NonIOWALFailureKeepsPublicationPin) {
+  BlockingLogEnv env(Env::Default());
+  Options options;
+  options.env = &env;
+  options.create_if_missing = true;
+  options.blob_value_size_threshold = 1;
+  options.blob_max_file_size = 512;
+  options.blob_gc_interval = 0;
+  const std::string dbname("testdb-non-io-wal-publication");
+  CleanDir(options.env, dbname);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  env.FailLogAppendAfterSuccessWithInvalidArgumentOnCall(2);
+  Status s = db->Put(WriteOptions(), "key", std::string(1100, 'v'));
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+
+  const std::string source = VLogFileName(dbname, 3);
+  ASSERT_TRUE(options.env->FileExists(source));
+  db->ManualGC(3);
+  db->WaitVLogGC();
+  EXPECT_TRUE(db->VLogBGError().ok()) << db->VLogBGError().ToString();
+  db->RemoveObsoleteBlob();
+  EXPECT_TRUE(options.env->FileExists(source));
+
+  delete db;
+  db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  std::string value;
+  ASSERT_TRUE(db->Get(ReadOptions(), "key", &value).ok());
+  EXPECT_EQ(std::string(1100, 'v'), value);
+
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, IndeterminateManifestSyncKeepsNewVLog) {
+  BlockingLogEnv env(Env::Default());
+  Options options;
+  options.env = &env;
+  options.create_if_missing = true;
+  options.blob_value_size_threshold = 1;
+  options.blob_max_file_size = 512;
+  options.blob_gc_interval = 0;
+  const std::string dbname("testdb-indeterminate-vlog-manifest");
+  CleanDir(options.env, dbname);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  env.FailNextVLogManifestSyncAfterSuccess();
+  Status s = db->Put(WriteOptions(), "orphan", std::string(1100, 'v'));
+  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+
+  // The failed rollover edit is indeterminate: it was durably appended to the
+  // current manifest before the injected error was returned. Its new writable
+  // vlog must remain pinned even though the in-memory edit was not applied.
+  const std::string uncertain_vlog = VLogFileName(dbname, 4);
+  ASSERT_TRUE(options.env->FileExists(uncertain_vlog));
+  db->RemoveObsoleteBlob();
+  EXPECT_TRUE(options.env->FileExists(uncertain_vlog));
+
+  delete db;
+  db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  ASSERT_TRUE(db->Put(WriteOptions(), "after", "recovered").ok());
+  std::string value;
+  ASSERT_TRUE(db->Get(ReadOptions(), "after", &value).ok());
+  EXPECT_EQ("recovered", value);
+
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(DBIMPL_TEST, GroupedWritesPreserveCallerBatches) {
+  BlockingLogEnv env(Env::Default());
+  Options options;
+  options.env = &env;
+  options.create_if_missing = true;
+  const std::string dbname("testdb-dbimpl-preserve-batches");
+  CleanDir(options.env, dbname);
+
+  DB* db = nullptr;
+  ASSERT_TRUE(DB::Open(options, dbname, &db).ok());
+  ASSERT_NE(nullptr, db);
+  DBImpl* db_impl = static_cast<DBImpl*>(db);
+
+  WriteBatch blocker_batch;
+  blocker_batch.Put("blocker", "blocker-value");
+  WriteBatch first_batch;
+  first_batch.Put("first", "first-value");
+  WriteBatch follower_batch;
+  follower_batch.Put("follower", "follower-value");
+  const std::string first_before =
+      WriteBatchInternal::Contents(&first_batch).ToString();
+  const std::string follower_before =
+      WriteBatchInternal::Contents(&follower_batch).ToString();
+
+  env.BlockNextLogAppend();
+  Status blocker_status;
+  Status first_status;
+  Status follower_status;
+  std::thread blocker([&] {
+    blocker_status = db->Write(WriteOptions(), &blocker_batch);
+  });
+  env.WaitForBlockedLogAppend();
+
+  std::thread first(
+      [&] { first_status = db->Write(WriteOptions(), &first_batch); });
+  std::thread follower(
+      [&] { follower_status = db->Write(WriteOptions(), &follower_batch); });
+  WaitForWriterQueueSize(db_impl, 3);
+  env.ReleaseLogAppend();
+
+  blocker.join();
+  first.join();
+  follower.join();
+
+  EXPECT_TRUE(blocker_status.ok()) << blocker_status.ToString();
+  EXPECT_TRUE(first_status.ok()) << first_status.ToString();
+  EXPECT_TRUE(follower_status.ok()) << follower_status.ToString();
+  EXPECT_EQ(first_before,
+            WriteBatchInternal::Contents(&first_batch).ToString());
+  EXPECT_EQ(follower_before,
+            WriteBatchInternal::Contents(&follower_batch).ToString());
+
+  std::string value;
+  ASSERT_TRUE(db->Get(ReadOptions(), "first", &value).ok());
+  EXPECT_EQ("first-value", value);
+  ASSERT_TRUE(db->Get(ReadOptions(), "follower", &value).ok());
+  EXPECT_EQ("follower-value", value);
+
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(DBIMPL_TEST, CallbackSegmentsDoNotDuplicateWrites) {
+  BlockingLogEnv env(Env::Default());
+  Options options;
+  options.env = &env;
+  options.create_if_missing = true;
+  const std::string dbname("testdb-dbimpl-callback-segments");
+  CleanDir(options.env, dbname);
+
+  DB* db = nullptr;
+  ASSERT_TRUE(DB::Open(options, dbname, &db).ok());
+  ASSERT_NE(nullptr, db);
+  DBImpl* db_impl = static_cast<DBImpl*>(db);
+
+  class CountingCallback : public WriteCallback {
+   public:
+    Status Callback(DB* db) override {
+      calls.fetch_add(1, std::memory_order_relaxed);
+      std::string value;
+      return db->Get(ReadOptions(), "first", &value);
+    }
+    bool AllowGrouping() const override { return true; }
+
+    std::atomic<int> calls{0};
+  } callback;
+
+  WriteBatch blocker_batch;
+  blocker_batch.Put("blocker", "0");
+  WriteBatch first_batch;
+  first_batch.Put("first", "1");
+  WriteBatch follower_batch;
+  follower_batch.Put("follower", "2");
+  WriteBatch callback_batch;
+  callback_batch.Put("callback", "3");
+  WriteBatch after_callback_batch;
+  after_callback_batch.Put("after", "4");
+
+  env.BlockNextLogAppend();
+  Status blocker_status;
+  Status first_status;
+  Status follower_status;
+  Status callback_status;
+  Status after_callback_status;
+  std::thread blocker([&] {
+    blocker_status = db->Write(WriteOptions(), &blocker_batch);
+  });
+  env.WaitForBlockedLogAppend();
+
+  std::thread first(
+      [&] { first_status = db->Write(WriteOptions(), &first_batch); });
+  WaitForWriterQueueSize(db_impl, 2);
+  std::thread follower(
+      [&] { follower_status = db->Write(WriteOptions(), &follower_batch); });
+  WaitForWriterQueueSize(db_impl, 3);
+  std::thread callback_writer([&] {
+    callback_status =
+        db->Write(WriteOptions(), &callback_batch, &callback);
+  });
+  WaitForWriterQueueSize(db_impl, 4);
+  std::thread after_callback([&] {
+    after_callback_status =
+        db->Write(WriteOptions(), &after_callback_batch);
+  });
+  WaitForWriterQueueSize(db_impl, 5);
+  env.ReleaseLogAppend();
+
+  blocker.join();
+  first.join();
+  follower.join();
+  callback_writer.join();
+  after_callback.join();
+
+  EXPECT_TRUE(blocker_status.ok()) << blocker_status.ToString();
+  EXPECT_TRUE(first_status.ok()) << first_status.ToString();
+  EXPECT_TRUE(follower_status.ok()) << follower_status.ToString();
+  EXPECT_TRUE(callback_status.ok()) << callback_status.ToString();
+  EXPECT_TRUE(after_callback_status.ok())
+      << after_callback_status.ToString();
+  EXPECT_EQ(1, callback.calls.load(std::memory_order_relaxed));
+  EXPECT_EQ(5U, db_impl->LatestSequence());
+
+  for (const std::string& key :
+       {"blocker", "first", "follower", "callback", "after"}) {
+    std::string value;
+    EXPECT_TRUE(db->Get(ReadOptions(), key, &value).ok()) << key;
+  }
+
+  delete db;
+  CleanDir(options.env, dbname);
 }
 
 TEST(VLOG_TEST, DBWrapperIterator) {
@@ -992,8 +2644,11 @@ TEST(VLOG_TEST, DBWrapperWriteBatch) {
     ASSERT_TRUE(s.ok());
   }
 
-  Slice begin("key" + std::to_string(0));
-  Slice end("key" + std::to_string(num_ondisk_batches * per_batch - 1));
+  const std::string begin_storage = "key" + std::to_string(0);
+  const std::string end_storage =
+      "key" + std::to_string(num_ondisk_batches * per_batch - 1);
+  Slice begin(begin_storage);
+  Slice end(end_storage);
   db->CompactRange(&begin, &end);
 
   for (auto& p : kvmap) {
@@ -1004,6 +2659,72 @@ TEST(VLOG_TEST, DBWrapperWriteBatch) {
 
   printf("%s", reinterpret_cast<BlobDB*>(db)->DebugString().c_str());
   delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, WriteBatchPreservesRepeatedKeyOrder) {
+  Options options;
+  options.create_if_missing = true;
+  options.blob_value_size_threshold = 16;
+  options.blob_gc_interval = 0;
+  options.blob_background_read_threads = 0;
+  const std::string dbname("testdb-write-batch-order");
+  CleanDir(options.env, dbname);
+
+  BlobDB* raw_db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &raw_db).ok());
+  std::unique_ptr<BlobDB> db(raw_db);
+  const std::string large_value(1024, 'x');
+
+  WriteBatch put_then_delete;
+  put_then_delete.Put("deleted", large_value);
+  put_then_delete.Delete("deleted");
+  ASSERT_TRUE(db->Write(WriteOptions(), &put_then_delete).ok());
+
+  std::string value;
+  EXPECT_TRUE(db->Get(ReadOptions(), "deleted", &value).IsNotFound());
+
+  WriteBatch delete_then_put;
+  delete_then_put.Delete("present");
+  delete_then_put.Put("present", large_value);
+  ASSERT_TRUE(db->Write(WriteOptions(), &delete_then_put).ok());
+  ASSERT_TRUE(db->Get(ReadOptions(), "present", &value).ok());
+  EXPECT_EQ(large_value, value);
+
+  db.reset();
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, PointGetRejectsTrailingValueHandleBytes) {
+  Options options;
+  options.create_if_missing = true;
+  options.blob_gc_interval = 0;
+  options.blob_background_read_threads = 0;
+  const std::string dbname("testdb-trailing-value-handle");
+  CleanDir(options.env, dbname);
+
+  DB* raw_lsm = nullptr;
+  ASSERT_TRUE(DB::Open(options, dbname, &raw_lsm).ok());
+  std::unique_ptr<DB> lsm(raw_lsm);
+
+  ValueHandle handle(3, 0, 0, 12);
+  std::string malformed_handle;
+  handle.EncodeTo(&malformed_handle);
+  malformed_handle.append("trailing-bytes");
+  WriteBatch batch;
+  WriteBatchInternal::Put(&batch, "key", malformed_handle,
+                          kTypeValueHandle);
+  ASSERT_TRUE(lsm->Write(WriteOptions(), &batch).ok());
+  lsm.reset();
+
+  BlobDB* raw_blob_db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &raw_blob_db).ok());
+  std::unique_ptr<BlobDB> blob_db(raw_blob_db);
+  std::string value;
+  const Status s = blob_db->Get(ReadOptions(), "key", &value);
+  EXPECT_TRUE(s.IsCorruption()) << s.ToString();
+
+  blob_db.reset();
   CleanDir(options.env, dbname);
 }
 
@@ -1057,8 +2778,11 @@ TEST(VLOG_TEST, DBWrapperNoGC) {
     kvmap[key] = val;
   }
 
-  Slice begin("key" + std::to_string(0));
-  Slice end("key" + std::to_string(num_ondisk_entries - 1));
+  const std::string begin_storage = "key" + std::to_string(0);
+  const std::string end_storage =
+      "key" + std::to_string(num_ondisk_entries - 1);
+  Slice begin(begin_storage);
+  Slice end(end_storage);
   db->CompactRange(&begin, &end);
 
   for (auto& p : kvmap) {
@@ -1133,8 +2857,10 @@ TEST(VLOG_TEST, ValueLogRecover) {
   uint32_t size = 72;
   uint32_t num_entries = 6;
   for (int i = 0; size <= options.blob_max_file_size / 2; i++) {
-    Slice key("k0" + std::to_string(i + 7));
-    Slice val("value0" + std::to_string(i + 7));
+    const std::string key_storage = "k0" + std::to_string(i + 7);
+    const std::string val_storage = "value0" + std::to_string(i + 7);
+    Slice key(key_storage);
+    Slice val(val_storage);
     v->Put(WriteOptions(), key, val, &handle);
     ASSERT_EQ(handle, ValueHandle(3, 0, size, SizeOf(key, val)));
     size += SizeOf(key, val);
@@ -1146,8 +2872,10 @@ TEST(VLOG_TEST, ValueLogRecover) {
 
   size = 0;
   for (int i = 1; i <= num_entries; i++) {
-    Slice key("k1" + std::to_string(i));
-    Slice val("value1" + std::to_string(i));
+    const std::string key_storage = "k1" + std::to_string(i);
+    const std::string val_storage = "value1" + std::to_string(i);
+    Slice key(key_storage);
+    Slice val(val_storage);
     v->Put(WriteOptions(), key, val, &handle);
     ASSERT_EQ(handle, ValueHandle(18, 0, size, SizeOf(key, val)));
     size += SizeOf(key, val);
@@ -1155,8 +2883,10 @@ TEST(VLOG_TEST, ValueLogRecover) {
 
   size = 0;
   for (int i = 1; i <= num_entries; i++) {
-    Slice key("k1" + std::to_string(i));
-    Slice val("value1" + std::to_string(i));
+    const std::string key_storage = "k1" + std::to_string(i);
+    const std::string val_storage = "value1" + std::to_string(i);
+    Slice key(key_storage);
+    Slice val(val_storage);
     s = v->Get(ReadOptions(), ValueHandle(18, 0, size, SizeOf(key, val)),
                &value);
     ASSERT_TRUE(s.ok());
@@ -1166,8 +2896,10 @@ TEST(VLOG_TEST, ValueLogRecover) {
 
   size = 0;
   for (int i = 1; i <= 1000000; i++) {
-    Slice key("k1" + std::to_string(i));
-    Slice val("value1" + std::to_string(i));
+    const std::string key_storage = "k1" + std::to_string(i);
+    const std::string val_storage = "value1" + std::to_string(i);
+    Slice key(key_storage);
+    Slice val(val_storage);
     s = v->Put(WriteOptions(), key, val, &handle);
     ASSERT_TRUE(s.ok());
     size += SizeOf(key, val);
@@ -1187,9 +2919,10 @@ TEST(VLOG_TEST, ConcurrentSPMC) {
   options.create_if_missing = true;
   options.blob_max_file_size = 8 << 20;
   std::string dbname("testdb");
+  CleanDir(options.env, dbname);
 
-  BlobDB* db;
-  BlobDB::Open(options, dbname, &db);
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
   std::deque<std::pair<std::string, std::string>> kvq;
   port::Mutex lk;
   port::CondVar cv(&lk);
@@ -1213,7 +2946,7 @@ TEST(VLOG_TEST, ConcurrentSPMC) {
             std::string val("value0" + std::to_string(j) +
                             std::string(1024, 'x'));
             auto s = db->Put(WriteOptions(), key, val);
-            ASSERT_TRUE(s.ok());
+            ASSERT_TRUE(s.ok()) << s.ToString();
             lk.Lock();
             kvq.emplace_back(key, val);
             lk.Unlock();
@@ -1240,7 +2973,7 @@ TEST(VLOG_TEST, ConcurrentSPMC) {
             kvq.pop_front();
             lk.Unlock();
             auto s = db->Get(ReadOptions(), key, &val);
-            ASSERT_TRUE(s.ok());
+            ASSERT_TRUE(s.ok()) << s.ToString();
             ASSERT_EQ(val, expected);
           }
           return;
@@ -1262,5 +2995,390 @@ TEST(VLOG_TEST, ConcurrentSPMC) {
   delete db;
   delete[] wth;
   delete[] rth;
+  CleanDir(options.env, dbname);
+}
+
+namespace {
+
+class BlockingAppendVLogEnv : public EnvWrapper {
+ public:
+  explicit BlockingAppendVLogEnv(Env* target) : EnvWrapper(target) {}
+
+  Status NewAppendableRandomAccessFile(
+      const std::string& filename,
+      AppendableRandomAccessFile** result) override {
+    AppendableRandomAccessFile* target_file = nullptr;
+    Status s = target()->NewAppendableRandomAccessFile(filename, &target_file);
+    if (!s.ok()) {
+      *result = nullptr;
+      return s;
+    }
+    *result = new File(this, target_file);
+    return Status::OK();
+  }
+
+  void BlockNextAppendV() {
+    std::lock_guard<std::mutex> lock(mu_);
+    block_next_ = true;
+    blocked_ = false;
+    release_ = false;
+  }
+
+  bool WaitForBlockedAppendV(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout, [this] { return blocked_; });
+  }
+
+  void ReleaseAppendV() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      release_ = true;
+    }
+    cv_.notify_all();
+  }
+
+ private:
+  class File : public AppendableRandomAccessFile {
+   public:
+    File(BlockingAppendVLogEnv* env, AppendableRandomAccessFile* target)
+        : env_(env), target_(target) {}
+    ~File() override { delete target_; }
+
+    Status Read(uint64_t offset, size_t n, Slice* result,
+                char* scratch) const override {
+      return target_->Read(offset, n, result, scratch);
+    }
+    Status Append(const Slice& data) override { return target_->Append(data); }
+    Status AppendV(const Slice* parts, size_t count) override {
+      {
+        std::unique_lock<std::mutex> lock(env_->mu_);
+        if (env_->block_next_) {
+          env_->block_next_ = false;
+          env_->blocked_ = true;
+          env_->cv_.notify_all();
+          env_->cv_.wait(lock, [this] { return env_->release_; });
+          env_->blocked_ = false;
+        }
+      }
+      return target_->AppendV(parts, count);
+    }
+    Status Close() override { return target_->Close(); }
+    Status Flush() override { return target_->Flush(); }
+    Status Sync() override { return target_->Sync(); }
+    uint64_t Offset() override { return target_->Offset(); }
+
+   private:
+    BlockingAppendVLogEnv* const env_;
+    AppendableRandomAccessFile* const target_;
+  };
+
+  std::mutex mu_;
+  std::condition_variable cv_;
+  bool block_next_{false};
+  bool blocked_{false};
+  bool release_{false};
+};
+
+class ErrorInjectingVLogFile : public AppendableRandomAccessFile {
+ public:
+  ErrorInjectingVLogFile(AppendableRandomAccessFile* target,
+                         std::atomic<bool>* fail_append,
+                         std::atomic<bool>* fail_sync)
+      : target_(target),
+        fail_append_(fail_append),
+        fail_sync_(fail_sync) {}
+
+  ~ErrorInjectingVLogFile() override { delete target_; }
+
+  Status Read(uint64_t offset, size_t n, Slice* result,
+              char* scratch) const override {
+    return target_->Read(offset, n, result, scratch);
+  }
+
+  Status Append(const Slice& data) override {
+    if (fail_append_->load(std::memory_order_acquire)) {
+      return Status::IOError("injected vlog append error");
+    }
+    return target_->Append(data);
+  }
+
+  Status AppendV(const Slice* parts, size_t count) override {
+    if (fail_append_->load(std::memory_order_acquire)) {
+      return Status::IOError("injected vlog append error");
+    }
+    return target_->AppendV(parts, count);
+  }
+
+  Status Close() override { return target_->Close(); }
+  Status Flush() override { return target_->Flush(); }
+
+  Status Sync() override {
+    if (fail_sync_->load(std::memory_order_acquire)) {
+      return Status::IOError("injected vlog sync error");
+    }
+    return target_->Sync();
+  }
+
+  uint64_t Offset() override { return target_->Offset(); }
+
+ private:
+  AppendableRandomAccessFile* const target_;
+  std::atomic<bool>* const fail_append_;
+  std::atomic<bool>* const fail_sync_;
+};
+
+class ErrorInjectingVLogEnv : public EnvWrapper {
+ public:
+  explicit ErrorInjectingVLogEnv(Env* target) : EnvWrapper(target) {}
+
+  Status NewAppendableRandomAccessFile(
+      const std::string& filename,
+      AppendableRandomAccessFile** result) override {
+    AppendableRandomAccessFile* target_file = nullptr;
+    Status s = target()->NewAppendableRandomAccessFile(filename, &target_file);
+    if (!s.ok()) {
+      *result = nullptr;
+      return s;
+    }
+    *result = new ErrorInjectingVLogFile(target_file, &fail_append, &fail_sync);
+    return Status::OK();
+  }
+
+  std::atomic<bool> fail_append{false};
+  std::atomic<bool> fail_sync{false};
+};
+
+}  // namespace
+
+TEST(VLOG_TEST, BlockedAppendDoesNotBlockReadOnlyVLogGet) {
+  BlockingAppendVLogEnv env(Env::Default());
+  Options options;
+  options.env = &env;
+  options.create_if_missing = true;
+  options.blob_value_size_threshold = 1;
+  options.blob_max_file_size = 1024;
+  options.blob_gc_interval = 0;
+  options.blob_background_read_threads = 0;
+  const std::string dbname("testdb-append-read-concurrency");
+  CleanDir(options.env, dbname);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  ASSERT_NE(nullptr, db);
+
+  // An oversized first value rolls its file, so reads of `old-key` use a
+  // read-only vlog while the next write appends to the new writable file.
+  const std::string old_value(2048, 'o');
+  ASSERT_TRUE(db->Put(WriteOptions(), "old-key", old_value).ok());
+
+  env.BlockNextAppendV();
+  Status write_status;
+  std::thread writer([&] {
+    write_status = db->Put(WriteOptions(), "new-key", std::string(512, 'n'));
+  });
+  const bool append_blocked =
+      env.WaitForBlockedAppendV(std::chrono::seconds(5));
+  if (!append_blocked) {
+    env.ReleaseAppendV();
+    writer.join();
+    ADD_FAILURE() << "timed out waiting for the injected AppendV block";
+    delete db;
+    CleanDir(options.env, dbname);
+    return;
+  }
+
+  Status read_status;
+  std::string actual;
+  std::mutex read_mu;
+  std::condition_variable read_cv;
+  bool read_done = false;
+  std::thread reader([&] {
+    read_status = db->Get(ReadOptions(), "old-key", &actual);
+    {
+      std::lock_guard<std::mutex> lock(read_mu);
+      read_done = true;
+    }
+    read_cv.notify_one();
+  });
+
+  bool read_completed_while_append_blocked = false;
+  {
+    std::unique_lock<std::mutex> lock(read_mu);
+    read_completed_while_append_blocked = read_cv.wait_for(
+        lock, std::chrono::seconds(5), [&] { return read_done; });
+  }
+
+  // Always unblock and join before asserting, so a regression fails without
+  // stranding a thread inside the fault-injection wrapper.
+  env.ReleaseAppendV();
+  writer.join();
+  reader.join();
+
+  EXPECT_TRUE(read_completed_while_append_blocked);
+  EXPECT_TRUE(read_status.ok()) << read_status.ToString();
+  EXPECT_EQ(old_value, actual);
+  EXPECT_TRUE(write_status.ok()) << write_status.ToString();
+
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, WriteErrorsDoNotPublishHandles) {
+  ErrorInjectingVLogEnv env(Env::Default());
+  Options options;
+  options.env = &env;
+  options.create_if_missing = true;
+  options.blob_value_size_threshold = 1;
+  options.blob_background_read_threads = 0;
+  const std::string dbname("testdb-vlog-write-errors");
+  CleanDir(options.env, dbname);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  ASSERT_NE(nullptr, db);
+  ASSERT_TRUE(db->Put(WriteOptions(), "committed", "value").ok());
+
+  env.fail_append.store(true, std::memory_order_release);
+  Status s = db->Put(WriteOptions(), "append-failed", "orphan");
+  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+
+  std::string value;
+  ASSERT_TRUE(db->Get(ReadOptions(), "append-failed", &value).IsNotFound());
+  ASSERT_TRUE(db->Get(ReadOptions(), "committed", &value).ok());
+  ASSERT_EQ("value", value);
+  delete db;
+  CleanDir(options.env, dbname);
+
+  env.fail_append.store(false, std::memory_order_release);
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  WriteOptions sync_options;
+  sync_options.sync = true;
+  env.fail_sync.store(true, std::memory_order_release);
+  s = db->Put(sync_options, "sync-failed", "orphan");
+  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+  ASSERT_TRUE(db->Get(ReadOptions(), "sync-failed", &value).IsNotFound());
+  delete db;
+  env.fail_sync.store(false, std::memory_order_release);
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, SyncSmallWriteFlushesEarlierNonsyncBlob) {
+  Options options;
+  options.create_if_missing = true;
+  options.blob_value_size_threshold = 1024;
+  options.blob_max_file_size = 1 << 20;
+  options.blob_gc_interval = 0;
+  options.blob_background_read_threads = 0;
+  const std::string dbname("testdb-cross-log-sync-barrier");
+  CleanDir(options.env, dbname);
+
+  BlobDB* raw_db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &raw_db).ok());
+  std::unique_ptr<BlobDB> db(raw_db);
+
+  const std::string blob_value(256 << 10, 'b');
+  WriteOptions nonsync;
+  nonsync.sync = false;
+  ASSERT_TRUE(db->Put(nonsync, "earlier-blob", blob_value).ok());
+
+  // This value stays in the LSM. Its sync barrier must still make the earlier
+  // value-log append durable before the corresponding LSM WAL is synced.
+  WriteOptions sync;
+  sync.sync = true;
+  ASSERT_TRUE(db->Put(sync, "barrier", "small").ok());
+
+  db.reset();
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &raw_db).ok());
+  db.reset(raw_db);
+
+  std::string value;
+  ASSERT_TRUE(db->Get(ReadOptions(), "earlier-blob", &value).ok());
+  EXPECT_EQ(blob_value, value);
+  ASSERT_TRUE(db->Get(ReadOptions(), "barrier", &value).ok());
+  EXPECT_EQ("small", value);
+
+  db.reset();
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, ConcurrentSyncAndNonsyncWritesAcrossRollover) {
+  Options options;
+  options.create_if_missing = true;
+  options.blob_value_size_threshold = 32;
+  options.blob_max_file_size = 8 << 10;
+  options.blob_gc_interval = 0;
+  options.blob_background_read_threads = 0;
+  const std::string dbname("testdb-concurrent-sync-rollover");
+  CleanDir(options.env, dbname);
+
+  BlobDB* raw_db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &raw_db).ok());
+  std::unique_ptr<BlobDB> db(raw_db);
+
+  constexpr int kWriters = 4;
+  constexpr int kWritesPerWriter = 64;
+  constexpr size_t kValueSize = 2048;
+  std::atomic<int> ready{0};
+  std::atomic<bool> start{false};
+  std::vector<Status> writer_status(kWriters);
+  std::vector<std::thread> writers;
+  writers.reserve(kWriters);
+
+  for (int writer = 0; writer < kWriters; ++writer) {
+    writers.emplace_back([&, writer] {
+      ready.fetch_add(1, std::memory_order_release);
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      for (int index = 0; index < kWritesPerWriter; ++index) {
+        const std::string key = "writer-" + std::to_string(writer) + "-" +
+                                std::to_string(index);
+        const std::string value(
+            kValueSize,
+            static_cast<char>('a' + (writer * kWritesPerWriter + index) % 26));
+        WriteOptions write_options;
+        write_options.sync = ((writer + index) & 1) == 0;
+        writer_status[writer] = db->Put(write_options, key, value);
+        if (!writer_status[writer].ok()) {
+          break;
+        }
+      }
+    });
+  }
+
+  while (ready.load(std::memory_order_acquire) != kWriters) {
+    std::this_thread::yield();
+  }
+  start.store(true, std::memory_order_release);
+  for (std::thread& writer : writers) {
+    writer.join();
+  }
+  for (const Status& status : writer_status) {
+    ASSERT_TRUE(status.ok()) << status.ToString();
+  }
+
+  auto verify_all = [&](BlobDB* database) {
+    for (int writer = 0; writer < kWriters; ++writer) {
+      for (int index = 0; index < kWritesPerWriter; ++index) {
+        const std::string key = "writer-" + std::to_string(writer) + "-" +
+                                std::to_string(index);
+        const std::string expected(
+            kValueSize,
+            static_cast<char>('a' + (writer * kWritesPerWriter + index) % 26));
+        std::string actual;
+        const Status status = database->Get(ReadOptions(), key, &actual);
+        ASSERT_TRUE(status.ok()) << key << ": " << status.ToString();
+        EXPECT_EQ(expected, actual) << key;
+      }
+    }
+  };
+
+  verify_all(db.get());
+  db.reset();
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &raw_db).ok());
+  db.reset(raw_db);
+  verify_all(db.get());
+
+  db.reset();
   CleanDir(options.env, dbname);
 }

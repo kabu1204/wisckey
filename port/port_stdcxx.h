@@ -168,40 +168,45 @@ class CondVar {
  */
 class LOCKABLE RWMutex : public RWLock {
  public:
-  RWMutex() : readers_(0) {}
+  RWMutex() : readers_(0), writer_(false), waiting_writers_(0) {}
   ~RWMutex() = default;
   RWMutex(const RWMutex&) = delete;
   RWMutex& operator=(const RWMutex&) = delete;
 
   void WLock() EXCLUSIVE_LOCK_FUNCTION() override {
     std::unique_lock<std::mutex> lk(mu_);
-    while (readers_ != 0) cv_.wait(lk, [this]() { return readers_ == 0; });
-    readers_ = 0b01;
+    ++waiting_writers_;
+    cv_.wait(lk, [this]() { return !writer_ && readers_ == 0; });
+    --waiting_writers_;
+    writer_ = true;
   }
 
   void WUnlock() UNLOCK_FUNCTION() override {
     std::unique_lock<std::mutex> lk(mu_);
-    readers_ = 0;
+    writer_ = false;
     cv_.notify_all();
   }
 
   void RLock() SHARED_LOCK_FUNCTION() override {
     std::unique_lock<std::mutex> lk(mu_);
-    while (readers_ & 0b01)
-      cv_.wait(lk, [this]() { return !(readers_ & 0b01); });
-    readers_ += 0b10;
+    cv_.wait(lk,
+             [this]() { return !writer_ && waiting_writers_ == 0; });
+    ++readers_;
   }
 
   void RUnlock() UNLOCK_FUNCTION() override {
     std::unique_lock<std::mutex> lk(mu_);
-    readers_ -= 0b10;
-    if (readers_ == 0) cv_.notify_one();
+    assert(readers_ > 0);
+    --readers_;
+    if (readers_ == 0) cv_.notify_all();
   }
 
  private:
   std::condition_variable cv_;
   std::mutex mu_;
   uint32_t readers_;
+  bool writer_;
+  uint32_t waiting_writers_;
 };
 
 inline bool Snappy_Compress(const char* input, size_t length,

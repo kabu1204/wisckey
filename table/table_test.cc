@@ -929,6 +929,14 @@ TEST(VLogTest, Sample){
   }
   ASSERT_EQ(n, kvmap.size());
 
+  // SeekToLast must initialize its traversal state on a fresh iterator.
+  delete iter;
+  iter = c.NewIterator();
+  iter->SeekToLast();
+  ASSERT_TRUE(iter->Valid()) << iter->status().ToString();
+  ASSERT_EQ("k07", iter->key());
+  ASSERT_EQ(kvmap["k07"], iter->value());
+
   ValueHandle handle;
   std::string handle_encoding;
   handle.size_ = 0;
@@ -981,6 +989,54 @@ TEST(VLogTest, Sample){
   ASSERT_EQ(num, 7);
 
   delete iter;
+}
+
+TEST(VLogTest, IteratorRejectsShortReads) {
+  Options options;
+
+  // The advertised limit includes the complete record, but the payload read
+  // returns fewer bytes with an OK status, as RandomAccessFile permits.
+  const std::string truncated_record("\x01\x01k", 3);
+  StringSource truncated_source(truncated_record);
+  VLogReader* reader = nullptr;
+  ASSERT_LEVELDB_OK(
+      VLogReader::Open(options, &truncated_source, 4, &reader));
+  Iterator* iter = reader->NewIterator(ReadOptions());
+  iter->SeekToFirst();
+  EXPECT_FALSE(iter->Valid());
+  EXPECT_TRUE(iter->status().IsCorruption()) << iter->status().ToString();
+  delete iter;
+  delete reader;
+
+  // A handle can also advertise more bytes than a short read returns even if
+  // the returned prefix happens to be a self-contained valid record.
+  const std::string complete_record("\x01\x01kv", 4);
+  StringSource short_source(complete_record);
+  reader = nullptr;
+  ASSERT_LEVELDB_OK(VLogReader::Open(options, &short_source, 5, &reader));
+  iter = reader->NewIterator(ReadOptions());
+  ValueHandle handle;
+  handle.offset_ = 0;
+  handle.size_ = 5;
+  std::string handle_encoding;
+  handle.EncodeTo(&handle_encoding);
+  iter->Seek(handle_encoding);
+  EXPECT_FALSE(iter->Valid());
+  EXPECT_TRUE(iter->status().IsCorruption()) << iter->status().ToString();
+
+  const std::string truncated_handle(1, static_cast<char>(0x80));
+  iter->Seek(truncated_handle);
+  EXPECT_FALSE(iter->Valid());
+  EXPECT_TRUE(iter->status().IsCorruption()) << iter->status().ToString();
+
+  handle.size_ = 4;
+  handle.EncodeTo(&handle_encoding);
+  handle_encoding.push_back('x');
+  iter->Seek(handle_encoding);
+  EXPECT_FALSE(iter->Valid());
+  EXPECT_TRUE(iter->status().IsCorruption()) << iter->status().ToString();
+  delete iter;
+  delete reader;
 }
 
 }  // namespace leveldb

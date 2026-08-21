@@ -4,10 +4,14 @@
 // Modifications Copyright 2023 Chengye YU <yuchengye2013 AT outlook.com>.
 
 #include "db/blob_db.h"
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <numeric>
 #include <sys/types.h>
+#include <vector>
 
 #include "leveldb/cache.h"
 #include "leveldb/comparator.h"
@@ -27,7 +31,9 @@
 //   Actual benchmarks:
 //      fillseq       -- write N values in sequential key order in async mode
 //      fillrandom    -- write N values in random key order in async mode
+//      fillrandomunique -- write every key exactly once in shuffled order
 //      overwrite     -- overwrite N values in random key order in async mode
+//      overwriteunique -- overwrite every key exactly once in shuffled order
 //      fillsync      -- write N/100 values in random key order in sync mode
 //      fill100K      -- write N/1000 100K values in random order in async mode
 //      deleteseq     -- delete N keys in sequential order
@@ -42,7 +48,8 @@
 //      open          -- cost of opening a DB
 //      crc32c        -- repeated crc32c of 4K of data
 //   Meta operations:
-//      compact     -- Compact the entire DB
+//      compact     -- Compact the LSM only (also when using BlobDB)
+//      vloggc      -- Run BlobDB value-log GC (--blob=1 only)
 //      stats       -- Print DB stats
 //      sstables    -- Print sstable info
 //      heapprofile -- Dump a heap profile (if supported by this port)
@@ -73,6 +80,13 @@ static int FLAGS_reads = -1;
 // Number of concurrent threads to run.
 static int FLAGS_threads = 1;
 
+// If true, --num/--reads describe aggregate work shared by all threads.
+// The historical db_bench behavior (false) runs that much work per thread.
+static bool FLAGS_threads_share_work = false;
+
+// Random-key domain. If negative, use FLAGS_num.
+static int FLAGS_key_range = -1;
+
 // Size of each value
 static int FLAGS_value_size = 100;
 
@@ -82,6 +96,11 @@ static double FLAGS_compression_ratio = 0.5;
 
 // Print histogram of operation timings
 static bool FLAGS_histogram = false;
+
+// Consume scan values by checksumming their bytes. The historical scan only
+// observes Slice lengths, which unfairly compares LevelDB's zero-copy values
+// with BlobDB's copied indirect values.
+static bool FLAGS_scan_checksum = false;
 
 // Count the number of string comparisons performed
 static bool FLAGS_comparisons = false;
@@ -136,10 +155,28 @@ static int FLAGS_blob_file_size = 64 << 20;
 static int FLAGS_blob_value_size_threshold = 1024;
 
 // Max background read threads of BlobDB when iterating
-static int FLAGS_blob_iter_threads = 8;
+static int FLAGS_blob_iter_threads = 0;
 
 // If true, enable background prefetch for BlobDB iterator
-static bool FLAGS_blob_iter_prefetch = true;
+static bool FLAGS_blob_iter_prefetch = false;
+
+static bool BenchmarkRequested(const char* list, const char* benchmark) {
+  const size_t benchmark_length = std::strlen(benchmark);
+  while (*list != '\0') {
+    const char* separator = std::strchr(list, ',');
+    const size_t item_length =
+        separator == nullptr ? std::strlen(list) : separator - list;
+    if (item_length == benchmark_length &&
+        std::memcmp(list, benchmark, benchmark_length) == 0) {
+      return true;
+    }
+    if (separator == nullptr) {
+      break;
+    }
+    list = separator + 1;
+  }
+  return false;
+}
 
 namespace leveldb {
 
@@ -391,6 +428,7 @@ class Benchmark {
   Cache* cache_;
   const FilterPolicy* filter_policy_;
   DB* db_;
+  BlobDB* blob_db_;
   int num_;
   int value_size_;
   int entries_per_batch_;
@@ -399,6 +437,7 @@ class Benchmark {
   int heap_counter_;
   CountComparator count_comparator_;
   int total_thread_count_;
+  std::vector<int> unique_keys_;
 
   void PrintHeader() {
     const int kKeySize = 16 + FLAGS_key_prefix;
@@ -485,6 +524,7 @@ class Benchmark {
                            ? NewBloomFilterPolicy(FLAGS_bloom_bits)
                            : nullptr),
         db_(nullptr),
+        blob_db_(nullptr),
         num_(FLAGS_num),
         value_size_(FLAGS_value_size),
         entries_per_batch_(1),
@@ -535,6 +575,7 @@ class Benchmark {
 
       void (Benchmark::*method)(ThreadState*) = nullptr;
       bool fresh_db = false;
+      bool unique_write = false;
       int num_threads = FLAGS_threads;
 
       if (name == Slice("open")) {
@@ -551,9 +592,19 @@ class Benchmark {
       } else if (name == Slice("fillrandom")) {
         fresh_db = true;
         method = &Benchmark::WriteRandom;
+      } else if (name == Slice("fillrandomunique")) {
+        fresh_db = true;
+        if (!FLAGS_threads_share_work) num_threads = 1;
+        unique_write = true;
+        method = &Benchmark::WriteRandomUnique;
       } else if (name == Slice("overwrite")) {
         fresh_db = false;
         method = &Benchmark::WriteRandom;
+      } else if (name == Slice("overwriteunique")) {
+        fresh_db = false;
+        if (!FLAGS_threads_share_work) num_threads = 1;
+        unique_write = true;
+        method = &Benchmark::WriteRandomUnique;
       } else if (name == Slice("fillsync")) {
         fresh_db = true;
         num_ /= 1000;
@@ -590,6 +641,14 @@ class Benchmark {
         method = &Benchmark::ReadWhileWriting;
       } else if (name == Slice("compact")) {
         method = &Benchmark::Compact;
+      } else if (name == Slice("vloggc")) {
+        num_threads = 1;
+        if (!FLAGS_blob) {
+          std::fprintf(stderr, "vloggc requires --blob=1\n");
+          std::exit(1);
+        } else {
+          method = &Benchmark::VLogGC;
+        }
       } else if (name == Slice("crc32c")) {
         method = &Benchmark::Crc32c;
       } else if (name == Slice("snappycomp")) {
@@ -623,6 +682,11 @@ class Benchmark {
       }
 
       if (method != nullptr) {
+        if (unique_write) {
+          PrepareUniqueKeys();
+        } else {
+          unique_keys_.clear();
+        }
         RunBenchmark(num_threads, name, method);
       }
     }
@@ -778,6 +842,7 @@ class Benchmark {
 
   void Open() {
     assert(db_ == nullptr);
+    blob_db_ = nullptr;
     Options options;
     options.env = g_env;
     options.create_if_missing = !FLAGS_use_existing_db;
@@ -795,12 +860,11 @@ class Benchmark {
         FLAGS_compression ? kSnappyCompression : kNoCompression;
     Status s;
     if (FLAGS_blob) {
-      BlobDB* blob_db;
       options.blob_value_size_threshold = FLAGS_blob_value_size_threshold;
       options.blob_background_read_threads = FLAGS_blob_iter_threads;
       options.blob_max_file_size = FLAGS_blob_file_size;
-      s = BlobDB::Open(options, FLAGS_db, &blob_db);
-      db_ = blob_db;
+      s = BlobDB::Open(options, FLAGS_db, &blob_db_);
+      db_ = blob_db_;
     } else {
       s = DB::Open(options, FLAGS_db, &db_);
     }
@@ -822,6 +886,34 @@ class Benchmark {
 
   void WriteRandom(ThreadState* thread) { DoWrite(thread, false); }
 
+  void PrepareUniqueKeys() {
+    unique_keys_.resize(KeyRange());
+    std::iota(unique_keys_.begin(), unique_keys_.end(), 0);
+    Random permutation(301);
+    for (int i = static_cast<int>(unique_keys_.size()) - 1; i > 0; --i) {
+      std::swap(unique_keys_[i],
+                unique_keys_[permutation.Uniform(i + 1)]);
+    }
+    unique_keys_.resize(num_);
+  }
+
+  int KeyRange() const {
+    return FLAGS_key_range > 0 ? FLAGS_key_range : FLAGS_num;
+  }
+
+  int WorkForThread(int total, const ThreadState* thread) const {
+    if (!FLAGS_threads_share_work) return total;
+    const int threads = thread->shared->total;
+    return total / threads + (thread->tid < (total % threads) ? 1 : 0);
+  }
+
+  int WorkStartForThread(int total, const ThreadState* thread) const {
+    if (!FLAGS_threads_share_work) return 0;
+    const int threads = thread->shared->total;
+    return thread->tid * (total / threads) +
+           std::min(thread->tid, total % threads);
+  }
+
   void DoWrite(ThreadState* thread, bool seq) {
     if (num_ != FLAGS_num) {
       char msg[100];
@@ -829,15 +921,18 @@ class Benchmark {
       thread->stats.AddMessage(msg);
     }
 
+    const int operations = WorkForThread(num_, thread);
+    const int operation_start = WorkStartForThread(num_, thread);
     RandomGenerator gen;
     WriteBatch batch;
     Status s;
     int64_t bytes = 0;
     KeyBuffer key;
-    for (int i = 0; i < num_; i += entries_per_batch_) {
+    for (int i = 0; i < operations; i += entries_per_batch_) {
       batch.Clear();
-      for (int j = 0; j < entries_per_batch_; j++) {
-        const int k = seq ? i + j : thread->rand.Uniform(FLAGS_num);
+      for (int j = 0; j < entries_per_batch_ && i + j < operations; j++) {
+        const int k = seq ? operation_start + i + j
+                          : thread->rand.Uniform(KeyRange());
         key.Set(k);
         batch.Put(key.slice(), gen.Generate(value_size_));
         bytes += value_size_ + key.slice().size();
@@ -852,18 +947,53 @@ class Benchmark {
     thread->stats.AddBytes(bytes);
   }
 
+  void WriteRandomUnique(ThreadState* thread) {
+    const int operations = WorkForThread(num_, thread);
+    const int operation_start = WorkStartForThread(num_, thread);
+    assert(unique_keys_.size() == static_cast<size_t>(num_));
+    RandomGenerator gen;
+    WriteBatch batch;
+    int64_t bytes = 0;
+    KeyBuffer key;
+    for (int i = 0; i < operations; ++i) {
+      const int k = unique_keys_[operation_start + i];
+      batch.Clear();
+      key.Set(k);
+      batch.Put(key.slice(), gen.Generate(value_size_));
+      Status s = db_->Write(write_options_, &batch);
+      if (!s.ok()) {
+        std::fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+        std::exit(1);
+      }
+      bytes += value_size_ + key.slice().size();
+      thread->stats.FinishedSingleOp();
+    }
+    thread->stats.AddBytes(bytes);
+  }
+
   void ReadSequential(ThreadState* thread) {
     ReadOptions opt;
     opt.blob_prefetch = FLAGS_blob_iter_prefetch;
     Iterator* iter = db_->NewIterator(opt);
+    const int operations = WorkForThread(reads_, thread);
     int i = 0;
     int64_t bytes = 0;
-    for (iter->SeekToFirst(); i < reads_ && iter->Valid(); iter->Next()) {
+    uint32_t checksum = 0;
+    for (iter->SeekToFirst(); i < operations && iter->Valid(); iter->Next()) {
+      if (FLAGS_scan_checksum) {
+        checksum = crc32c::Extend(checksum, iter->value().data(),
+                                  iter->value().size());
+      }
       bytes += iter->key().size() + iter->value().size();
       thread->stats.FinishedSingleOp();
       ++i;
     }
     delete iter;
+    if (FLAGS_scan_checksum) {
+      const std::string message =
+          "(checksum " + std::to_string(checksum) + ")";
+      thread->stats.AddMessage(message);
+    }
     thread->stats.AddBytes(bytes);
   }
 
@@ -871,14 +1001,25 @@ class Benchmark {
     ReadOptions opt;
     opt.blob_prefetch = FLAGS_blob_iter_prefetch;
     Iterator* iter = db_->NewIterator(opt);
+    const int operations = WorkForThread(reads_, thread);
     int i = 0;
     int64_t bytes = 0;
-    for (iter->SeekToLast(); i < reads_ && iter->Valid(); iter->Prev()) {
+    uint32_t checksum = 0;
+    for (iter->SeekToLast(); i < operations && iter->Valid(); iter->Prev()) {
+      if (FLAGS_scan_checksum) {
+        checksum = crc32c::Extend(checksum, iter->value().data(),
+                                  iter->value().size());
+      }
       bytes += iter->key().size() + iter->value().size();
       thread->stats.FinishedSingleOp();
       ++i;
     }
     delete iter;
+    if (FLAGS_scan_checksum) {
+      const std::string message =
+          "(checksum " + std::to_string(checksum) + ")";
+      thread->stats.AddMessage(message);
+    }
     thread->stats.AddBytes(bytes);
   }
 
@@ -888,8 +1029,9 @@ class Benchmark {
     int found = 0;
     int64_t bytes = 0;
     KeyBuffer key;
-    for (int i = 0; i < reads_; i++) {
-      const int k = thread->rand.Uniform(FLAGS_num);
+    const int operations = WorkForThread(reads_, thread);
+    for (int i = 0; i < operations; i++) {
+      const int k = thread->rand.Uniform(KeyRange());
       key.Set(k);
       if (db_->Get(options, key.slice(), &value).ok()) {
         found++;
@@ -898,7 +1040,7 @@ class Benchmark {
       thread->stats.FinishedSingleOp();
     }
     char msg[100];
-    std::snprintf(msg, sizeof(msg), "(%d of %d found)", found, num_);
+    std::snprintf(msg, sizeof(msg), "(%d of %d found)", found, operations);
     thread->stats.AddMessage(msg);
     thread->stats.AddBytes(bytes);
   }
@@ -907,8 +1049,9 @@ class Benchmark {
     ReadOptions options;
     std::string value;
     KeyBuffer key;
-    for (int i = 0; i < reads_; i++) {
-      const int k = thread->rand.Uniform(FLAGS_num);
+    const int operations = WorkForThread(reads_, thread);
+    for (int i = 0; i < operations; i++) {
+      const int k = thread->rand.Uniform(KeyRange());
       key.Set(k);
       Slice s = Slice(key.slice().data(), key.slice().size() - 1);
       db_->Get(options, s, &value);
@@ -919,9 +1062,10 @@ class Benchmark {
   void ReadHot(ThreadState* thread) {
     ReadOptions options;
     std::string value;
-    const int range = (FLAGS_num + 99) / 100;
+    const int range = (KeyRange() + 99) / 100;
     KeyBuffer key;
-    for (int i = 0; i < reads_; i++) {
+    const int operations = WorkForThread(reads_, thread);
+    for (int i = 0; i < operations; i++) {
       const int k = thread->rand.Uniform(range);
       key.Set(k);
       db_->Get(options, key.slice(), &value);
@@ -934,9 +1078,10 @@ class Benchmark {
     options.blob_prefetch = FLAGS_blob_iter_prefetch;
     int found = 0;
     KeyBuffer key;
-    for (int i = 0; i < reads_; i++) {
+    const int operations = WorkForThread(reads_, thread);
+    for (int i = 0; i < operations; i++) {
       Iterator* iter = db_->NewIterator(options);
-      const int k = thread->rand.Uniform(FLAGS_num);
+      const int k = thread->rand.Uniform(KeyRange());
       key.Set(k);
       iter->Seek(key.slice());
       if (iter->Valid() && iter->key() == key.slice()) found++;
@@ -944,7 +1089,7 @@ class Benchmark {
       thread->stats.FinishedSingleOp();
     }
     char msg[100];
-    snprintf(msg, sizeof(msg), "(%d of %d found)", found, num_);
+    std::snprintf(msg, sizeof(msg), "(%d of %d found)", found, operations);
     thread->stats.AddMessage(msg);
   }
 
@@ -955,8 +1100,9 @@ class Benchmark {
     int found = 0;
     int k = 0;
     KeyBuffer key;
-    for (int i = 0; i < reads_; i++) {
-      k = (k + (thread->rand.Uniform(100))) % FLAGS_num;
+    const int operations = WorkForThread(reads_, thread);
+    for (int i = 0; i < operations; i++) {
+      k = (k + (thread->rand.Uniform(100))) % KeyRange();
       key.Set(k);
       iter->Seek(key.slice());
       if (iter->Valid() && iter->key() == key.slice()) found++;
@@ -964,7 +1110,7 @@ class Benchmark {
     }
     delete iter;
     char msg[100];
-    std::snprintf(msg, sizeof(msg), "(%d of %d found)", found, num_);
+    std::snprintf(msg, sizeof(msg), "(%d of %d found)", found, operations);
     thread->stats.AddMessage(msg);
   }
 
@@ -973,10 +1119,13 @@ class Benchmark {
     WriteBatch batch;
     Status s;
     KeyBuffer key;
-    for (int i = 0; i < num_; i += entries_per_batch_) {
+    const int operations = WorkForThread(num_, thread);
+    const int operation_start = WorkStartForThread(num_, thread);
+    for (int i = 0; i < operations; i += entries_per_batch_) {
       batch.Clear();
-      for (int j = 0; j < entries_per_batch_; j++) {
-        const int k = seq ? i + j : (thread->rand.Uniform(FLAGS_num));
+      for (int j = 0; j < entries_per_batch_ && i + j < operations; j++) {
+        const int k = seq ? operation_start + i + j
+                          : thread->rand.Uniform(KeyRange());
         key.Set(k);
         batch.Delete(key.slice());
         thread->stats.FinishedSingleOp();
@@ -1009,7 +1158,7 @@ class Benchmark {
           }
         }
 
-        const int k = thread->rand.Uniform(FLAGS_num);
+        const int k = thread->rand.Uniform(KeyRange());
         key.Set(k);
         Status s =
             db_->Put(write_options_, key.slice(), gen.Generate(value_size_));
@@ -1024,7 +1173,23 @@ class Benchmark {
     }
   }
 
-  void Compact(ThreadState* thread) { db_->CompactRange(nullptr, nullptr); }
+  void Compact(ThreadState* thread) {
+    db_->CompactRange(nullptr, nullptr);
+    thread->stats.AddMessage("(LSM only)");
+  }
+
+  void VLogGC(ThreadState* thread) {
+    if (blob_db_ == nullptr) {
+      std::fprintf(stderr, "vloggc requires --blob=1\n");
+      std::exit(1);
+    }
+    const Status s = blob_db_->RunVLogGC();
+    if (!s.ok()) {
+      std::fprintf(stderr, "vloggc error: %s\n", s.ToString().c_str());
+      std::exit(1);
+    }
+    thread->stats.AddMessage("(value-log GC only)");
+  }
 
   void PrintStats(const char* key) {
     std::string stats;
@@ -1095,8 +1260,16 @@ int main(int argc, char** argv) {
       FLAGS_reads = n;
     } else if (sscanf(argv[i], "--threads=%d%c", &n, &junk) == 1) {
       FLAGS_threads = n;
+    } else if (sscanf(argv[i], "--threads_share_work=%d%c", &n, &junk) == 1 &&
+               (n == 0 || n == 1)) {
+      FLAGS_threads_share_work = n;
+    } else if (sscanf(argv[i], "--key_range=%d%c", &n, &junk) == 1) {
+      FLAGS_key_range = n;
     } else if (sscanf(argv[i], "--value_size=%d%c", &n, &junk) == 1) {
       FLAGS_value_size = n;
+    } else if (sscanf(argv[i], "--scan_checksum=%d%c", &n, &junk) == 1 &&
+               (n == 0 || n == 1)) {
+      FLAGS_scan_checksum = n;
     } else if (sscanf(argv[i], "--write_buffer_size=%d%c", &n, &junk) == 1) {
       FLAGS_write_buffer_size = n;
     } else if (sscanf(argv[i], "--max_file_size=%d%c", &n, &junk) == 1) {
@@ -1130,6 +1303,52 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "Invalid flag '%s'\n", argv[i]);
       std::exit(1);
     }
+  }
+
+  if (FLAGS_num <= 0) {
+    std::fprintf(stderr, "--num must be positive\n");
+    return 1;
+  }
+  if (FLAGS_reads == 0 || FLAGS_reads < -1) {
+    std::fprintf(stderr, "--reads must be positive or -1\n");
+    return 1;
+  }
+  if (FLAGS_threads <= 0) {
+    std::fprintf(stderr, "--threads must be positive\n");
+    return 1;
+  }
+  if (FLAGS_key_range == 0 || FLAGS_key_range < -1) {
+    std::fprintf(stderr, "--key_range must be positive or -1\n");
+    return 1;
+  }
+  if (FLAGS_key_range > 0 && FLAGS_key_range < FLAGS_num &&
+      (std::strstr(FLAGS_benchmarks, "fillrandomunique") != nullptr ||
+       std::strstr(FLAGS_benchmarks, "overwriteunique") != nullptr)) {
+    std::fprintf(stderr,
+                 "--key_range must be at least --num for unique writes\n");
+    return 1;
+  }
+  if (FLAGS_value_size < 0) {
+    std::fprintf(stderr, "--value_size must not be negative\n");
+    return 1;
+  }
+  if (FLAGS_key_prefix < 0 || FLAGS_key_prefix + 16 >= 1024) {
+    std::fprintf(stderr, "--key_prefix must be between 0 and 1007\n");
+    return 1;
+  }
+  if (FLAGS_blob_iter_threads < 0) {
+    std::fprintf(stderr, "--blob_iter_threads must not be negative\n");
+    return 1;
+  }
+  if (FLAGS_blob_file_size <= 0 || FLAGS_blob_value_size_threshold < 0) {
+    std::fprintf(stderr, "invalid BlobDB size option\n");
+    return 1;
+  }
+  if (!FLAGS_blob && BenchmarkRequested(FLAGS_benchmarks, "vloggc")) {
+    std::fprintf(stderr,
+                 "benchmark 'vloggc' requires --blob=1; 'compact' only "
+                 "compacts the LSM\n");
+    return 1;
   }
 
   leveldb::g_env = leveldb::Env::Default();

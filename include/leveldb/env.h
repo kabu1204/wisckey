@@ -113,9 +113,10 @@ class LEVELDB_EXPORT Env {
   virtual Status NewAppendableFile(const std::string& fname,
                                    WritableFile** result);
 
-  virtual Status NewAppendableRandomAccessFile(const std::string& filename,
-                                       AppendableRandomAccessFile** result){
-    return Status::OK();
+  virtual Status NewAppendableRandomAccessFile(
+      const std::string& filename, AppendableRandomAccessFile** result) {
+    *result = nullptr;
+    return Status::NotSupported("appendable random access files");
   }
 
   virtual Status TruncateFile(const std::string& filename, uint64_t fileSize){
@@ -331,6 +332,18 @@ class LEVELDB_EXPORT AppendableRandomAccessFile : public RandomAccessFile,
   ~AppendableRandomAccessFile() override;
 
   virtual uint64_t Offset() { return 0; }
+
+  // Append multiple non-contiguous slices in order. Keep new virtual methods
+  // after the original interface so existing vtable slots remain stable.
+  // The default preserves source compatibility with custom Envs.
+  virtual Status AppendV(const Slice* parts, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+      Status s = Append(parts[i]);
+      if (!s.ok()) return s;
+    }
+    return Status::OK();
+  }
+
 };
 
 // An interface for writing log messages.
@@ -402,9 +415,9 @@ class LEVELDB_EXPORT EnvWrapper : public Env {
   size_t PageSize() const override {
     return target_->PageSize();
   }
-  Status NewAppendableRandomAccessFile(const std::string& filename,
-                                               AppendableRandomAccessFile** result) override
-  {
+  Status NewAppendableRandomAccessFile(
+      const std::string& filename,
+      AppendableRandomAccessFile** result) override {
     return target_->NewAppendableRandomAccessFile(filename, result);
   }
 

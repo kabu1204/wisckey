@@ -400,7 +400,13 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
 
   ForEachOverlapping(state.saver.user_key, state.ikey, &state, &State::Match);
 
-  if (valueType != nullptr) *valueType = state.saver.valueType;
+  // SaveValue initializes valueType only after it parses an entry for this
+  // user key.  A miss (including an empty Version) must not read or publish
+  // that otherwise-uninitialized field.
+  if (valueType != nullptr &&
+      (state.saver.state == kFound || state.saver.state == kDeleted)) {
+    *valueType = state.saver.valueType;
+  }
 
   return state.found ? state.s : Status::NotFound(Slice());
 }
@@ -825,6 +831,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
   // Initialize new descriptor log file if necessary by creating
   // a temporary file that contains a snapshot of the current version.
   std::string new_manifest_file;
+  bool current_update_attempted = false;
   Status s;
   if (descriptor_log_ == nullptr) {
     // No reason to unlock *mu here since we only hit this path in the
@@ -858,6 +865,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     // If we just created a new descriptor file, install it by writing a
     // new CURRENT file that points to it.
     if (s.ok() && !new_manifest_file.empty()) {
+      current_update_attempted = true;
       s = SetCurrentFile(env_, dbname_, manifest_file_number_);
     }
 
@@ -876,7 +884,13 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
       delete descriptor_file_;
       descriptor_log_ = nullptr;
       descriptor_file_ = nullptr;
-      env_->RemoveFile(new_manifest_file);
+      // RenameFile can fail while syncing the parent directory after the
+      // atomic rename itself succeeded. In that indeterminate case CURRENT
+      // may already name this manifest, so retaining an unused file is safer
+      // than creating a dangling CURRENT pointer.
+      if (!current_update_attempted) {
+        env_->RemoveFile(new_manifest_file);
+      }
     }
   }
 

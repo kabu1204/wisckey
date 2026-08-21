@@ -50,16 +50,15 @@ const int kNumNonTableCacheFiles = 10;
  *    |  w0.next | |   w3.next  |
  *    |__________| |____________|
  *
- * w0.batch also holds the contents of w1.batch and w2.batch
- * w3.batch holds the contents of w3-w6.batch
- *
- * w0 and w3 are called leaders.
+ * w0 and w3 are called leaders. Grouped operations are assembled in
+ * DBImpl::tmp_batch_ so the caller-owned batches remain unchanged.
  * w0 is the first leader of the WriteGroup.
  */
 struct DBImpl::Writer {
   explicit Writer(port::Mutex* mu)
       : batch(nullptr),
         callback(nullptr),
+        write_state(WriteState::kNotWritten),
         sync(false),
         done(false),
         next(nullptr),
@@ -68,6 +67,7 @@ struct DBImpl::Writer {
   Status status;
   WriteBatch* batch;
   WriteCallback* callback;
+  WriteState write_state;
   Writer* next;
   bool sync;
   bool done;
@@ -1160,6 +1160,11 @@ int64_t DBImpl::TEST_MaxNextLevelOverlappingBytes() {
   return versions_->MaxNextLevelOverlappingBytes();
 }
 
+size_t DBImpl::TEST_WriterQueueSize() {
+  MutexLock l(&mutex_);
+  return writers_.size();
+}
+
 void DBImpl::TEST_BuildWriterGroup() {
   MutexLock l(&mutex_);
   assert(writers_.empty());
@@ -1195,11 +1200,12 @@ void DBImpl::TEST_BuildWriterGroup() {
     TestIterHandler() : i(0) {}
     ~TestIterHandler() override = default;
     void Put(const Slice& key, const Slice& value) override {
+      assert(i < expected.size());
       assert(key == expected[i].first);
       assert(value == expected[i].second);
       i++;
     }
-    void Delete(const Slice& key) override {}
+    void Delete(const Slice& key) override { assert(false); }
     int i;
     std::vector<std::pair<std::string, std::string>> expected;
   };
@@ -1337,15 +1343,13 @@ void DBImpl::TEST_BuildWriterGroup() {
   // [W0|W1|W2|W3|W4|W5|W6|W7|W8|W9]
 
   BuildWriterGroup(&wg);
-  std::vector<int> expected_leaders = {0, 3, 4, 5, 7};
+  std::vector<int> expected_leaders = {0, 3};
   std::vector<std::vector<std::pair<std::string, std::string>>> want = {
-      {{"key0", "val0"}, {"key1", "val1"}, {"key2", "val2"}},
-      {{"key3", "val3"}},
-      {},
-      {},
-      {{"key7", "val7"}, {"key8", "val8"}}};
+      {{"key0", "val0"}},
+      {{"key3", "val3"}}};
 
-  assert(wg.last_writer == writers_[8]);
+  // A force-flush request is left at the queue head for its own Write call.
+  assert(wg.last_writer == writers_[3]);
 
   int i = 0;
   for (Writer* cur = wg.first_leader; cur != nullptr; cur = cur->next) {
@@ -1353,7 +1357,8 @@ void DBImpl::TEST_BuildWriterGroup() {
     if (cur->batch != nullptr) {
       TestIterHandler handler;
       handler.expected = want[i];
-      cur->batch->Iterate(&handler);
+      assert(cur->batch->Iterate(&handler).ok());
+      assert(handler.i == handler.expected.size());
     } else {
       assert(want[i].empty());
     }
@@ -1362,6 +1367,21 @@ void DBImpl::TEST_BuildWriterGroup() {
              expected_leaders[i]);
     }
     i++;
+  }
+  assert(i == expected_leaders.size());
+
+  // Building a group must not append follower operations into any
+  // caller-owned batch. Every queued batch still contains exactly the
+  // operation with which it was created.
+  for (int writer_index : {0, 1, 2, 3, 7, 8, 9}) {
+    TestIterHandler handler;
+    const std::string value =
+        writer_index == 9 ? std::string(1 << 21, 'x')
+                          : "val" + std::to_string(writer_index);
+    handler.expected = {
+        {"key" + std::to_string(writer_index), value}};
+    assert(writers_[writer_index]->batch->Iterate(&handler).ok());
+    assert(handler.i == handler.expected.size());
   }
 
   for (auto p : writers_) {
@@ -1475,19 +1495,71 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
 }
 
 Status DBImpl::Sync() {
+  // Enqueue the barrier behind all earlier writers. Taking mutex_ alone is not
+  // sufficient because the active writer deliberately drops it while
+  // appending to the WAL, and WritableFile only promises single-threaded
+  // access.
+  //
+  // This must not be implemented as an empty Write(): MakeRoomForWrite() may
+  // rotate a full memtable's unsynced WAL before the empty batch syncs the new
+  // WAL. A dedicated queue entry syncs the WAL containing all earlier writes
+  // without first rotating it.
+  Writer w(&mutex_);
+  w.sync = true;
+
   MutexLock l(&mutex_);
-  return logfile_->Sync();
+  writers_.push_back(&w);
+  while (!w.done && &w != writers_.front()) {
+    w.cv.Wait();
+  }
+  if (w.done) {
+    return w.status;
+  }
+
+  Status status = bg_error_;
+  // An earlier writer may already have rotated an unsynced WAL into imm_. In
+  // that case the old WAL is durable only after its immutable memtable and
+  // manifest edit have been synced by the background flush.
+  while (status.ok() && imm_ != nullptr) {
+    background_work_finished_signal_.Wait();
+    status = bg_error_;
+  }
+  if (status.ok()) {
+    mutex_.Unlock();
+    status = logfile_->Sync();
+    mutex_.Lock();
+    if (!status.ok()) {
+      // The durability of earlier WAL appends is now indeterminate.
+      RecordBackgroundError(status);
+    }
+  }
+
+  assert(!writers_.empty() && writers_.front() == &w);
+  writers_.pop_front();
+  if (!writers_.empty()) {
+    writers_.front()->cv.Signal();
+  }
+  return status;
 }
 
 Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   return Write(options, updates, nullptr);
 }
 
-/*
- * The WriteBatch may be modified.
- */
+// The sequence header of an ungrouped WriteBatch may be modified. Grouped
+// records are assembled in tmp_batch_ so follower operations are never
+// appended to caller-owned batches.
 Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates,
                      WriteCallback* callback) {
+  return WriteWithOutcome(options, updates, callback, nullptr);
+}
+
+Status DBImpl::WriteWithOutcome(const WriteOptions& options,
+                                WriteBatch* updates, WriteCallback* callback,
+                                WriteState* write_state) {
+  if (write_state != nullptr) {
+    *write_state = WriteState::kNotWritten;
+  }
   Writer w(&mutex_);
   w.batch = updates;
   w.sync = options.sync;
@@ -1500,78 +1572,135 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates,
     w.cv.Wait();
   }
   if (w.done) {
+    if (write_state != nullptr) {
+      *write_state = w.write_state;
+    }
     return w.status;
   }
 
   // &w == writers_.front() is TRUE
   // May temporarily unlock and wait.
   Status status = MakeRoomForWrite(updates == nullptr);
+  // MakeRoomForWrite may rotate a dirty WAL into imm_ immediately before this
+  // sync write is appended to a fresh log. The new log's Sync alone cannot
+  // make those earlier writes durable, so wait for the retired WAL's memtable
+  // and manifest publication before allowing the sync write to complete.
+  while (status.ok() && w.sync && imm_ != nullptr) {
+    background_work_finished_signal_.Wait();
+    status = bg_error_;
+  }
+  Status first_writer_status = status;
+  WriteState first_writer_state = WriteState::kNotWritten;
   uint64_t last_sequence = versions_->LastSequence();
-  Writer* last_writer = &w;
   if (status.ok() && updates != nullptr) {  // nullptr batch is for compactions
     WriterGroup writer_group;
-    Writer* cur_leader;
-    WriteBatch* write_batch;
     BuildWriterGroup(&writer_group);
     assert(writer_group.first_leader == &w);
 
-    for (cur_leader = writer_group.first_leader; cur_leader != nullptr;
-         cur_leader = cur_leader->next) {
-      mutex_.Unlock();
-      write_batch = cur_leader->batch;
-
-      if (cur_leader->callback != nullptr &&
-          !cur_leader->callback->Callback(this).ok()) {
-        mutex_.Lock();
-        goto NOTIFY;
+    bool stop_group = false;
+    Status group_error;
+    Writer* cur_leader = writer_group.first_leader;
+    while (cur_leader != nullptr) {
+      Writer* next_leader = cur_leader->next;
+      bool leader_sync = false;
+      size_t segment_writers = 0;
+      for (Writer* queued : writers_) {
+        if (queued == next_leader) break;
+        leader_sync = leader_sync || queued->sync;
+        ++segment_writers;
+        if (queued == writer_group.last_writer) break;
       }
 
-      if (write_batch == nullptr) {
-        mutex_.Lock();
-        goto NOTIFY;
-      }
+      Status leader_status = stop_group ? group_error : Status::OK();
+      WriteState leader_state = WriteState::kNotWritten;
+      WriteBatch* write_batch = cur_leader->batch;
+      bool storage_error = false;
+      bool sequence_assigned = false;
+      bool callback_rejected = false;
 
-      WriteBatchInternal::SetSequence(write_batch, last_sequence + 1);
-      last_sequence += WriteBatchInternal::Count(write_batch);
-      {
-        status = log_->AddRecord(WriteBatchInternal::Contents(write_batch));
-        bool sync_error = false;
-        if (status.ok() && options.sync) {
-          // TODO: we may sync logfile many times within a sync WriteGroup
-          status = logfile_->Sync();
-          if (!status.ok()) {
-            sync_error = true;
+      if (!stop_group) {
+        if (segment_writers > 1) {
+          tmp_batch_->Clear();
+          for (Writer* queued : writers_) {
+            if (queued == next_leader) break;
+            WriteBatchInternal::Append(tmp_batch_, queued->batch);
+            if (queued == writer_group.last_writer) break;
           }
-        }
-        if (status.ok()) {
-          status = WriteBatchInternal::InsertInto(write_batch, mem_);
+          write_batch = tmp_batch_;
         }
 
+        mutex_.Unlock();
+
+        if (cur_leader->callback != nullptr) {
+          leader_status = cur_leader->callback->Callback(this);
+          callback_rejected = !leader_status.ok();
+        }
+
+        bool sync_error = false;
+        if (!callback_rejected && write_batch != nullptr) {
+          WriteBatchInternal::SetSequence(write_batch, last_sequence + 1);
+          last_sequence += WriteBatchInternal::Count(write_batch);
+          sequence_assigned = true;
+          // log::Writer::AddRecord can report an error after emitting part or
+          // all of a record, so every failure from this point is
+          // indeterminate until recovery examines the WAL.
+          leader_state = WriteState::kMayBeWritten;
+          leader_status =
+              log_->AddRecord(WriteBatchInternal::Contents(write_batch));
+          if (leader_status.ok() && leader_sync) {
+            leader_status = logfile_->Sync();
+            sync_error = !leader_status.ok();
+          }
+          if (leader_status.ok()) {
+            leader_status = WriteBatchInternal::InsertInto(write_batch, mem_);
+          }
+          if (leader_status.ok()) {
+            leader_state = WriteState::kApplied;
+          }
+          storage_error = !leader_status.ok();
+        }
         mutex_.Lock();
+
         if (sync_error) {
           // The state of the log file is indeterminate: the log record we
           // just added may or may not show up when the DB is re-opened.
           // So we force the DB into a mode where all future writes fail.
-          RecordBackgroundError(status);
+          RecordBackgroundError(leader_status);
+        }
+
+        if (sequence_assigned) {
+          versions_->SetLastSequence(last_sequence);
+        }
+        if (write_batch == tmp_batch_) tmp_batch_->Clear();
+
+        // A rejected callback applies only to its own batch. A WAL, sync, or
+        // memtable failure makes the remainder of this already-built group
+        // fail without running more callbacks.
+        if (storage_error) {
+          stop_group = true;
+          group_error = leader_status;
         }
       }
-      if (write_batch == tmp_batch_) tmp_batch_->Clear();
 
-      versions_->SetLastSequence(last_sequence);
+      if (cur_leader == &w) {
+        first_writer_status = leader_status;
+        first_writer_state = leader_state;
+      }
 
-    NOTIFY:
-      while (true) {
+      while (!writers_.empty() && writers_.front() != next_leader) {
         Writer* ready = writers_.front();
         writers_.pop_front();
-        if (ready != cur_leader->next && ready != &w) {
-          ready->status = status;
+        if (ready != &w) {
+          ready->status = leader_status;
+          ready->write_state = leader_state;
           ready->done = true;
           ready->cv.Signal();
         }
-        if (ready == cur_leader->next || ready == last_writer) {
+        if (ready == writer_group.last_writer) {
           break;
         }
       }
+      cur_leader = next_leader;
     }
   } else {
     assert(writers_.front() == &w);
@@ -1583,7 +1712,10 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates,
     writers_.front()->cv.Signal();
   }
 
-  return status;
+  if (write_state != nullptr) {
+    *write_state = first_writer_state;
+  }
+  return first_writer_status;
 }
 
 // REQUIRES: Writer list must be non-empty
@@ -1592,7 +1724,6 @@ void DBImpl::BuildWriterGroup(WriterGroup* group) {
   mutex_.AssertHeld();
   assert(!writers_.empty());
   Writer* cur_leader = writers_.front();
-  Writer* prev_leader = nullptr;
   group->first_leader = cur_leader;
   bool sync = cur_leader->sync;
   assert(cur_leader->batch != nullptr);
@@ -1617,12 +1748,23 @@ void DBImpl::BuildWriterGroup(WriterGroup* group) {
   for (; iter != writers_.end(); ++iter) {
     Writer* w = *iter;
 
+    // A null batch is a force-flush request. It must become queue leader and
+    // execute MakeRoomForWrite(true), not be acknowledged by another writer.
+    if (w->batch == nullptr) {
+      break;
+    }
+
     if (w->sync && !sync) {
       // Do not include a sync write into a batch handled by a non-sync write.
       break;
     }
 
     if (w->callback && !w->callback->AllowGrouping()) {
+      break;
+    }
+
+    const size_t writer_size = WriteBatchInternal::ByteSize(w->batch);
+    if (writer_size > max_size - std::min(size, max_size)) {
       break;
     }
 
@@ -1633,33 +1775,11 @@ void DBImpl::BuildWriterGroup(WriterGroup* group) {
        *
        * We need to switch to a new leader.
        */
-      prev_leader = cur_leader;
       cur_leader->next = w;
       cur_leader = w;
-      prev_have_callback = (w->callback != nullptr);
     }
-
-    if (w->batch != nullptr) {
-      size += WriteBatchInternal::ByteSize(w->batch);
-      if (size > max_size) {
-        // Do not make batch too big
-        if (cur_leader == w) {
-          // we just switched to a new leader, but the new leader
-          // will not be included in the writer group.
-          prev_leader->next = nullptr;
-        }
-        break;
-      }
-
-      if (cur_leader->batch == nullptr) {
-        cur_leader->next = w;
-        cur_leader = w;
-      }
-
-      if (w != cur_leader) {
-        WriteBatchInternal::Append(cur_leader->batch, w->batch);
-      }
-    }
+    size += writer_size;
+    prev_have_callback = (w->callback != nullptr);
     group->last_writer = w;
   }
 }
@@ -1852,7 +1972,8 @@ DB::~DB() = default;
 Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
   *dbptr = nullptr;
 
-  options.env->SetPoolBackgroundThreads(1);  // compaction
+  options.env->SetPoolBackgroundThreads(
+      std::max(1, options.env->GetPoolBackgroundThreads()));  // compaction
   DBImpl* impl = new DBImpl(options, dbname);
   impl->mutex_.Lock();
   VersionEdit edit;

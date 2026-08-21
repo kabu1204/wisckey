@@ -3,6 +3,9 @@
 
 #include "db/blob_db.h"
 
+#include <algorithm>
+#include <limits>
+
 #include "db/blob_vlog_impl.h"
 #include "db/db_iter.h"
 #include "db/filename.h"
@@ -15,38 +18,62 @@
 
 namespace leveldb {
 
-class DivideHandler : public WriteBatch::Handler {
+enum class DividedEntryType { kValue, kValueHandle, kDeletion };
+
+struct DividedEntry {
+  DividedEntryType type;
+  Slice key;
+  Slice value;
+  size_t handle_index;
+};
+
+class DivideHandler final : public WriteBatch::Handler {
  public:
-  DivideHandler() = default;
+  DivideHandler(size_t threshold, ValueBatch* large,
+                std::vector<DividedEntry>* entries)
+      : threshold_(threshold), large_(large), entries_(entries) {}
   ~DivideHandler() override = default;
 
   void Put(const Slice& key, const Slice& value) override {
-    if (value.size() >= threshold) {
-      vb->Put(key, value);
+    if (value.size() >= threshold_) {
+      const size_t handle_index = large_->NumEntries();
+      large_->PutBorrowed(key, value);
+      entries_->push_back(
+          {DividedEntryType::kValueHandle, key, Slice(), handle_index});
     } else {
-      small->Put(key, value);
+      entries_->push_back({DividedEntryType::kValue, key, value, 0});
     }
   }
 
-  void Delete(const Slice& key) override { small->Delete(key); }
+  void Delete(const Slice& key) override {
+    entries_->push_back({DividedEntryType::kDeletion, key, Slice(), 0});
+  }
 
-  size_t threshold;
-  ValueBatch* vb;
-  WriteBatch* small;
+ private:
+  const size_t threshold_;
+  ValueBatch* const large_;
+  std::vector<DividedEntry>* const entries_;
 };
 
 Status ValueLogImpl::Open(const Options& options, const std::string& dbname,
                           DB* db, ValueLogImpl** vlog) {
-  assert(db != nullptr);
-  if (vlog != nullptr) {
-    *vlog = nullptr;
+  if (vlog == nullptr) {
+    return Status::InvalidArgument("null value log output");
+  }
+  *vlog = nullptr;
+  if (db == nullptr) {
+    return Status::InvalidArgument("null database for value log");
   }
 
   ValueLogImpl* vlog_impl = new ValueLogImpl(options, dbname, db);
-  vlog_impl->Recover();
+  Status s = vlog_impl->Recover();
+  if (!s.ok()) {
+    delete vlog_impl;
+    return s;
+  }
+  vlog_impl->StartGCThread();
   *vlog = vlog_impl;
-
-  return Status::OK();
+  return s;
 }
 
 BlobDB::~BlobDB() {
@@ -60,34 +87,94 @@ Status BlobDB::Write(const WriteOptions& options, WriteBatch* updates) {
 
 Status BlobDB::Write(const WriteOptions& options, WriteBatch* updates,
                      WriteCallback* callback) {
-  // TODO batching the updates;
-  Status s;
-  WriteBatch small;
+  // Nonsync writes retain normal DBImpl concurrency. A sync write forms an
+  // exclusive cross-log barrier: it waits for earlier handle publications,
+  // blocks later vlog appends, syncs the vlog, then syncs the LSM WAL.
+  if (options.sync) {
+    WriteLock commit(&vlog_->commit_lock_);
+    return WriteInternal(options, updates, callback);
+  }
+  ReadLock commit(&vlog_->commit_lock_);
+  return WriteInternal(options, updates, callback);
+}
+
+Status BlobDB::WriteInternal(const WriteOptions& options, WriteBatch* updates,
+                             WriteCallback* callback) {
+  if (updates == nullptr) {
+    return Status::InvalidArgument("null BlobDB write batch");
+  }
+
   ValueBatch large;
-  s = DivideWriteBatch(updates, &small, &large);
+  std::vector<DividedEntry> entries;
+  entries.reserve(WriteBatchInternal::Count(updates));
+  DivideHandler handler(options_.blob_value_size_threshold, &large, &entries);
+  Status s = updates->Iterate(&handler);
   if (!s.ok()) {
     return s;
   }
 
-  {
-    WriteLock l(&rwlock_);
-    s = vlog_->Write(options, &large);
+  // The overwhelmingly common delete/small-value path needs no transformed
+  // batch and must not touch or sync the value log.
+  if (large.NumEntries() == 0) {
+    if (options.sync) {
+      s = vlog_->SyncVLog();
+      if (!s.ok()) return s;
+    }
+    return db_->Write(options, updates, callback);
   }
-  if (s.ok()) {
-    large.ToWriteBatch(&small);
-    s = db_->Write(options, &small, callback);
-  }
-  return s;
-}
 
-Status BlobDB::DivideWriteBatch(WriteBatch* input, WriteBatch* small,
-                                ValueBatch* large) {
-  assert(input != nullptr && small != nullptr && large != nullptr);
-  DivideHandler handler;
-  handler.threshold = options_.blob_value_size_threshold;
-  handler.small = small;
-  handler.vb = large;
-  Status s = input->Iterate(&handler);
+  uint64_t publication_token = 0;
+  WriteOptions vlog_options = options;
+  vlog_options.sync = false;  // the ordered barrier below performs one sync
+  s = vlog_->Write(vlog_options, &large, &publication_token);
+  if (!s.ok()) {
+    return s;
+  }
+
+  // Rebuild in the original operation order. The old split-small-then-append-
+  // handles implementation changed the result of batches containing repeated
+  // keys (for example, Put(large) followed by Delete).
+  WriteBatch transformed;
+  std::string handle_encoding;
+  const std::vector<ValueHandle>& handles = large.Handles();
+  for (const DividedEntry& entry : entries) {
+    switch (entry.type) {
+      case DividedEntryType::kValue:
+        transformed.Put(entry.key, entry.value);
+        break;
+      case DividedEntryType::kValueHandle:
+        if (entry.handle_index >= handles.size()) {
+          vlog_->ReleasePublication(publication_token);
+          return Status::Corruption("missing value handle after vlog write");
+        }
+        handle_encoding.clear();
+        handles[entry.handle_index].EncodeTo(&handle_encoding);
+        WriteBatchInternal::Put(&transformed, entry.key, handle_encoding,
+                                kTypeValueHandle);
+        break;
+      case DividedEntryType::kDeletion:
+        transformed.Delete(entry.key);
+        break;
+      }
+  }
+  if (options.sync) {
+    s = vlog_->SyncVLog();
+    if (!s.ok()) {
+      vlog_->ReleasePublication(publication_token);
+      return s;
+    }
+  }
+  DBImpl::WriteState write_state = DBImpl::WriteState::kNotWritten;
+  s = db_->WriteWithOutcome(options, &transformed, callback, &write_state);
+  if (s.ok() || write_state == DBImpl::WriteState::kNotWritten) {
+    vlog_->ReleasePublication(publication_token);
+  }
+  // Once WAL emission starts, any error can be indeterminate regardless of
+  // its Status category: the record may have reached durable storage even
+  // though DBImpl did not publish it to the memtable.
+  // Conservatively retain the file pin until restart so GC cannot remove a
+  // vlog which crash recovery might later reference. Recovery reconstructs
+  // the authoritative handle set and naturally drops this in-memory pin.
   return s;
 }
 
@@ -117,7 +204,13 @@ Status BlobDB::Get(const ReadOptions& options, const Slice& key,
 
   ValueHandle handle;
   Slice input(*value);
-  handle.DecodeFrom(&input);
+  s = handle.DecodeFrom(&input);
+  if (s.ok() && !input.empty()) {
+    s = Status::Corruption("trailing bytes in value-log handle");
+  }
+  if (!s.ok()) {
+    return s;
+  }
   s = vlog_->Get(options, handle, value);
 
   if (s.ok() || options.snapshot != nullptr || !s.IsNotFound()) {
@@ -221,8 +314,17 @@ void BlobDB::CompactRange(const Slice* begin, const Slice* end) {
 
 Status BlobDB::Open(const Options& options, const std::string& name,
                     BlobDB** dbptr) {
-  if (dbptr != nullptr) {
-    *dbptr = nullptr;
+  if (dbptr == nullptr) {
+    return Status::InvalidArgument("null BlobDB output");
+  }
+  *dbptr = nullptr;
+  if (options.blob_max_file_size == 0 ||
+      options.blob_max_file_size > std::numeric_limits<uint32_t>::max()) {
+    return Status::InvalidArgument("blob_max_file_size must be in [1, 4GiB]");
+  }
+  if (options.blob_background_read_threads < 0) {
+    return Status::InvalidArgument(
+        "blob_background_read_threads must not be negative");
   }
   Log(options.info_log,
       "Creating BlobDB, "
@@ -248,24 +350,25 @@ Status BlobDB::Open(const Options& options, const std::string& name,
     delete db;
     return s;
   }
-  options.env->SetPoolBackgroundThreads(
-      options.blob_background_read_threads + 1 +
-      options.env->GetPoolBackgroundThreads());
+  const int desired_background_threads =
+      options.blob_background_read_threads + 2;  // LSM, vlog GC, prefetch
+  options.env->SetPoolBackgroundThreads(std::max(
+      options.env->GetPoolBackgroundThreads(), desired_background_threads));
   BlobDB* dbWrapper = new BlobDB(options, name, db, vlog);
-  if (dbptr != nullptr) {
-    *dbptr = dbWrapper;
-  }
+  *dbptr = dbWrapper;
   return s;
 }
 
 void BlobDB::ManualGC(uint64_t number) { vlog_->ManualGC(number); }
+
+Status BlobDB::RunVLogGC() { return vlog_->RunGC(); }
 
 Status BlobDB::VLogBGError() {
   MutexLock l(&vlog_->mutex_);
   return vlog_->bg_error_;
 }
 
-Status BlobDB::SyncLSM() { return db_->Sync(); }
+Status BlobDB::SyncLSM() { return vlog_->SyncLSM(); }
 
 void BlobDB::RemoveObsoleteBlob() {
   WriteLock l(&vlog_->rwlock_);

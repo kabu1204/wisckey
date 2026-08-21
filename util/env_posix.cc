@@ -11,6 +11,7 @@
 #endif
 #include <atomic>
 #include <cerrno>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -24,10 +25,12 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <thread>
 #include <type_traits>
 #include <unistd.h>
 #include <utility>
+#include <vector>
 
 #include "leveldb/env.h"
 #include "leveldb/slice.h"
@@ -68,13 +71,6 @@ Status PosixError(const std::string& context, int error_number) {
   } else {
     return Status::IOError(context, std::strerror(error_number));
   }
-}
-
-// REQUIRES: p is multiple of 2
-uint64_t AlignBackward(uint64_t x, uint64_t p){
-  if(x & (p-1))
-    x = (x+p) & (~(p-1));
-  return x;
 }
 
 // Helper class to limit resource usage to avoid exhaustion.
@@ -462,7 +458,9 @@ class PosixWritableFile final : public WritableFile {
 
   // True if the given file is a manifest file.
   static bool IsManifest(const std::string& filename) {
-    return Basename(filename).starts_with("MANIFEST");
+    const Slice basename = Basename(filename);
+    return basename.starts_with("MANIFEST") ||
+           basename.starts_with("VLOG-MANIFEST");
   }
 
   // buf_[0, pos_ - 1] contains data to be written to fd_.
@@ -475,160 +473,280 @@ class PosixWritableFile final : public WritableFile {
   const std::string dirname_;  // The directory of filename_.
 };
 
-class PosixMmapAppendableFile final: public AppendableRandomAccessFile {
+class PosixAppendableRandomAccessFile final
+    : public AppendableRandomAccessFile {
  public:
-  // REQUIRES: len is multiple of OS page_size
-  // REQUIRES: reserved > file_size
-  // REQUIRES: O_TRUNC enabled when open fd
-  PosixMmapAppendableFile(std::string filename, size_t file_size, size_t reserved,
-                          int fd)
+  PosixAppendableRandomAccessFile(std::string filename, uint64_t file_size,
+                                  int fd)
       : filename_(std::move(filename)),
+        dirname_(Dirname(filename_)),
         len_(file_size),
-        cap_(0),
-        reserved_(reserved),
-        prev_sync_(0),
-        fd_(fd),
-        page_size_(getpagesize())
-  {
-    reserved_ = AlignBackward(std::max<uint64_t>(file_size << 1, reserved),
-                              page_size_);  // max(2 * fileSize, reserved)
+        fd_(fd) {}
 
-    mmap_base_ = (char*)::mmap(NULL, reserved_, PROT_NONE,
-                               MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if (mmap_base_ == MAP_FAILED) {
-      status_ = Status::IOError("failed to mmap reserved space");
-      printf("[LOG] mmap failed");
-      return;
+  PosixAppendableRandomAccessFile(
+      const PosixAppendableRandomAccessFile&) = delete;
+  PosixAppendableRandomAccessFile& operator=(
+      const PosixAppendableRandomAccessFile&) = delete;
+
+  ~PosixAppendableRandomAccessFile() override {
+    // A failed pwrite may leave a partial trailing record. Keep the physical
+    // file at the last fully appended offset so an orderly shutdown cannot
+    // turn that partial record into recovery input.
+    if (fd_ >= 0) {
+      const int truncate_result =
+          ::ftruncate(fd_, static_cast<off_t>(len_));
+      (void)truncate_result;
+      (void)::close(fd_);
     }
-
-    assert(reserved_ > file_size);
-    assert(!(reserved_ & (page_size_ - 1)));
-    ExtendMmapSize(file_size);
-    //    printf("[LOG] init: len_=%lu, cap_=%lu, reserved_=%lu\n", len_.load(),
-    //    cap_,
-    //           reserved_);
   }
 
-  PosixMmapAppendableFile(const PosixMmapAppendableFile&) = delete;
-  PosixMmapAppendableFile& operator=(const PosixMmapAppendableFile&) = delete;
-
-  virtual ~PosixMmapAppendableFile() override {
-    ::munmap(static_cast<void*>(mmap_base_), reserved_);
-    if(ftruncate(fd_, len_)<0){
-      printf("failed to truncate file when closing\n");
-    }
-    //    printf("[LOG] truncate file size from %lu to %lu\n", cap_,
-    //    len_.load());
-    close(fd_);
-  }
-
-  virtual Status Read(uint64_t offset, size_t n, Slice* result,
-                      char* scratch) const override {
-    if(!status_.ok()) return status_;
-
+  Status Read(uint64_t offset, size_t n, Slice* result,
+              char* scratch) const override {
     ReadLock l(&rwlock);
-    if (offset + n > len_.load()) {
+    if (offset > len_ || n > len_ - offset) {
       *result = Slice();
-      return PosixError(filename_, EINVAL);
+      return Status::InvalidArgument(filename_, "read past end of file");
     }
 
-    *result = Slice(mmap_base_ + offset, n);
+    size_t done = 0;
+    while (done < n) {
+      const ssize_t read_result =
+          ::pread(fd_, scratch + done, n - done,
+                  static_cast<off_t>(offset + done));
+      if (read_result < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        *result = Slice();
+        return PosixError(filename_, errno);
+      }
+      if (read_result == 0) {
+        *result = Slice(scratch, done);
+        return Status::Corruption(filename_, "short read");
+      }
+      done += static_cast<size_t>(read_result);
+    }
+    *result = Slice(scratch, n);
     return Status::OK();
   }
 
-  virtual Status Append(const Slice& data) override {
-    if(!status_.ok()) return status_;
-    size_t write_size = data.size();
-    const char* write_data = data.data();
-
+  Status Append(const Slice& data) override {
     WriteLock l(&rwlock);
-    if (len_ + write_size > cap_) {
-      ExtendMmapSize(len_ + write_size);
-      if (!status_.ok()) {
+    if (!status_.ok()) {
+      return status_;
+    }
+    const uint64_t max_offset =
+        static_cast<uint64_t>(std::numeric_limits<off_t>::max());
+    if (len_ > max_offset || data.size() > max_offset - len_) {
+      status_ = Status::InvalidArgument(filename_, "file is too large");
+      return status_;
+    }
+
+    size_t done = 0;
+    while (done < data.size()) {
+      const ssize_t write_result =
+          ::pwrite(fd_, data.data() + done, data.size() - done,
+                   static_cast<off_t>(len_ + done));
+      if (write_result < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        status_ = PosixError(filename_, errno);
         return status_;
+      }
+      if (write_result == 0) {
+        status_ = Status::IOError(filename_, "zero-byte pwrite");
+        return status_;
+      }
+      done += static_cast<size_t>(write_result);
+    }
+    len_ += data.size();
+    return Status::OK();
+  }
+
+  Status AppendV(const Slice* parts, size_t count) override {
+    WriteLock l(&rwlock);
+    if (!status_.ok()) {
+      return status_;
+    }
+    if (parts == nullptr && count != 0) {
+      status_ = Status::InvalidArgument(filename_, "null append vector");
+      return status_;
+    }
+
+    const uint64_t max_offset =
+        static_cast<uint64_t>(std::numeric_limits<off_t>::max());
+    uint64_t total_size = 0;
+    for (size_t i = 0; i < count; ++i) {
+      if (parts[i].size() > max_offset - total_size) {
+        status_ = Status::InvalidArgument(filename_, "file is too large");
+        return status_;
+      }
+      total_size += parts[i].size();
+    }
+    if (len_ > max_offset || total_size > max_offset - len_) {
+      status_ = Status::InvalidArgument(filename_, "file is too large");
+      return status_;
+    }
+
+    const long configured_iov_max = ::sysconf(_SC_IOV_MAX);
+    const size_t max_iov = static_cast<size_t>(
+        configured_iov_max > 0 ? configured_iov_max : 1024);
+    std::vector<struct iovec> iovecs;
+    iovecs.reserve(max_iov);
+
+    size_t part_index = 0;
+    size_t part_offset = 0;
+    uint64_t done = 0;
+    while (part_index < count) {
+      iovecs.clear();
+      size_t next_index = part_index;
+      size_t next_offset = part_offset;
+      size_t call_size = 0;
+      while (next_index < count && iovecs.size() < max_iov &&
+             call_size < static_cast<size_t>(SSIZE_MAX)) {
+        if (next_offset == parts[next_index].size()) {
+          ++next_index;
+          next_offset = 0;
+          continue;
+        }
+        const size_t available = parts[next_index].size() - next_offset;
+        const size_t length =
+            std::min(available, static_cast<size_t>(SSIZE_MAX) - call_size);
+        struct iovec iov;
+        iov.iov_base =
+            const_cast<char*>(parts[next_index].data() + next_offset);
+        iov.iov_len = length;
+        iovecs.push_back(iov);
+        call_size += length;
+        if (length == available) {
+          ++next_index;
+          next_offset = 0;
+        } else {
+          next_offset += length;
+        }
+      }
+
+      if (iovecs.empty()) {
+        break;
+      }
+      const ssize_t write_result =
+          ::pwritev(fd_, iovecs.data(), static_cast<int>(iovecs.size()),
+                    static_cast<off_t>(len_ + done));
+      if (write_result < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        status_ = PosixError(filename_, errno);
+        return status_;
+      }
+      if (write_result == 0) {
+        status_ = Status::IOError(filename_, "zero-byte pwritev");
+        return status_;
+      }
+
+      size_t consumed = static_cast<size_t>(write_result);
+      done += consumed;
+      while (part_index < count && consumed != 0) {
+        const size_t available = parts[part_index].size() - part_offset;
+        if (consumed < available) {
+          part_offset += consumed;
+          consumed = 0;
+        } else {
+          consumed -= available;
+          ++part_index;
+          part_offset = 0;
+        }
       }
     }
 
-    std::memcpy(mmap_base_ + len_, write_data, write_size);
-    len_ += write_size;
-
-    return status_;
-  }
-
-  virtual Status Close() override {
-    return Status::OK();
-  }
-
-  virtual Status Flush() override {
-    return Status::OK();
-  }
-
-  virtual Status Sync() override {
-    WriteLock l(&rwlock);
-    assert(len_ >= prev_sync_);
-    if(len_ - prev_sync_ <= 0) return status_;
-    if(::msync(mmap_base_+prev_sync_, len_ - prev_sync_, MS_SYNC)<0){
-      status_ =  Status::IOError("failed to msync()");
+    if (done != total_size) {
+      status_ = Status::IOError(filename_, "incomplete pwritev");
+      return status_;
     }
-    //    printf("[LOG] Sync from %lu to %lu\n", prev_sync_, len_.load());
-    prev_sync_ = len_;
+    len_ += total_size;
+    return Status::OK();
+  }
+
+  Status Close() override {
+    WriteLock l(&rwlock);
+    if (fd_ < 0) {
+      return status_;
+    }
+    // Even after an append error, discard any partial trailing pwrite before
+    // closing. Preserve the original error unless truncation is the first
+    // failure observed by this file.
+    if (::ftruncate(fd_, static_cast<off_t>(len_)) != 0 && status_.ok()) {
+      status_ = PosixError(filename_, errno);
+    }
+    if (::close(fd_) != 0 && status_.ok()) {
+      status_ = PosixError(filename_, errno);
+    }
+    fd_ = -1;
     return status_;
   }
 
-  uint64_t Offset() override { return len_.load(); }
+  Status Flush() override { return status(); }
+
+  Status Sync() override {
+    WriteLock l(&rwlock);
+    if (!status_.ok()) {
+      return status_;
+    }
+    bool file_synced = false;
+#if HAVE_FULLFSYNC
+    if (::fcntl(fd_, F_FULLFSYNC) == 0) {
+      file_synced = true;
+    }
+#endif  // HAVE_FULLFSYNC
+#if HAVE_FDATASYNC
+    if (!file_synced && ::fdatasync(fd_) != 0) {
+#else
+    if (!file_synced && ::fsync(fd_) != 0) {
+#endif  // HAVE_FDATASYNC
+      status_ = PosixError(filename_, errno);
+    }
+    if (status_.ok() && !dir_synced_) {
+      const int dir_fd = ::open(dirname_.c_str(), O_RDONLY | kOpenBaseFlags);
+      if (dir_fd < 0) {
+        status_ = PosixError(dirname_, errno);
+      } else {
+        if (::fsync(dir_fd) != 0) {
+          status_ = PosixError(dirname_, errno);
+        }
+        (void)::close(dir_fd);
+      }
+      if (status_.ok()) {
+        dir_synced_ = true;
+      }
+    }
+    return status_;
+  }
+
+  uint64_t Offset() override {
+    ReadLock l(&rwlock);
+    return len_;
+  }
 
  private:
-  Status ExtendMmapSize(size_t need) {
-    rwlock.AssertWLockHeld();
-    size_t oldcap = cap_;
-    size_t newcap = AlignBackward(oldcap + (oldcap >> 1), page_size_);
-    if (newcap < need) {
-      newcap = AlignBackward(need + (need >> 1), page_size_);  // 1.5 * need
-    }
-    if (newcap < page_size_) {
-      newcap = page_size_;
-    }
-    if (ftruncate(fd_, newcap) < 0) {
-      status_ = Status::IOError("failed to truncate file");
-      return status_;
-    }
+  static std::string Dirname(const std::string& filename) {
+    const std::string::size_type separator = filename.rfind('/');
+    return separator == std::string::npos ? "."
+                                          : filename.substr(0, separator);
+  }
 
-    if (newcap > reserved_) {
-      ::munmap(mmap_base_, reserved_);
-      reserved_ = reserved_ << 1;
-      mmap_base_ = (char*)::mmap(NULL, reserved_, PROT_NONE,
-                                 MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-      if(mmap_base_==MAP_FAILED){
-        status_ = Status::IOError("failed to mmap reserved space");
-        return status_;
-      }
-      //      printf("[LOG] Extended reserved space from %lu to %lu\n",
-      //      reserved_>>1, reserved_);
-      oldcap = 0;
-    }
-
-    char* addr = (char*)::mmap(mmap_base_ + oldcap, newcap - oldcap, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd_, oldcap);
-    if(addr==MAP_FAILED || addr != mmap_base_ + oldcap){
-      status_ = Status::IOError("failed to mmap file to reserved space");
-      return status_;
-    }
-
-    //    printf("[LOG] Extended file mapping from %lu to %lu\n", oldcap,
-    //    newcap);
-    cap_ = newcap;
+  Status status() const {
+    ReadLock l(&rwlock);
     return status_;
   }
 
   mutable port::RWMutex rwlock;
   Status status_;
-  const size_t page_size_;
   const std::string filename_;
-  char* mmap_base_ GUARDED_BY(rwlock);
-  std::atomic<size_t> len_;              // file used length
-  size_t prev_sync_ GUARDED_BY(rwlock);  // previous sync point
-  size_t cap_ GUARDED_BY(rwlock);        // file mapped length
-  size_t reserved_ GUARDED_BY(rwlock);   // mmap reserved
-  int fd_;
+  const std::string dirname_;
+  uint64_t len_ GUARDED_BY(rwlock);
+  int fd_ GUARDED_BY(rwlock);
+  bool dir_synced_{false};
 };
 
 int LockOrUnlock(int fd, bool lock) {
@@ -765,19 +883,20 @@ class PosixEnv : public Env {
 
   Status NewAppendableRandomAccessFile(const std::string& filename,
                                        AppendableRandomAccessFile** result) override {
-    int fd = ::open(filename.c_str(),
-                    O_APPEND | O_RDWR | O_CREAT | kOpenBaseFlags, 0644);
+    *result = nullptr;
+    int fd = ::open(filename.c_str(), O_RDWR | O_CREAT | kOpenBaseFlags, 0644);
     if (fd < 0) {
       *result = nullptr;
       return PosixError(filename, errno);
     }
-    uint64_t file_size;
+    uint64_t file_size = 0;
     Status status = GetFileSize(filename, &file_size);
-    if(status.ok()){
-      uint64_t reserved = std::max<uint64_t>(file_size<<1, 8 << 20);
-      *result = new PosixMmapAppendableFile(filename, file_size, reserved, fd);
+    if (status.ok()) {
+      *result = new PosixAppendableRandomAccessFile(filename, file_size, fd);
+    } else {
+      ::close(fd);
     }
-    return Status::OK();
+    return status;
   }
 
   Status TruncateFile(const std::string& filename, uint64_t fileSize) override {
@@ -847,6 +966,33 @@ class PosixEnv : public Env {
     if (std::rename(from.c_str(), to.c_str()) != 0) {
       return PosixError(from, errno);
     }
+
+    // rename() is atomic but not power-loss durable until the affected
+    // directory entries are synced. CURRENT/VLOG-CURRENT publication relies
+    // on this ordering to keep a durable manifest reachable after restart.
+    auto dirname = [](const std::string& path) {
+      const std::string::size_type separator = path.rfind('/');
+      return separator == std::string::npos ? std::string(".")
+                                             : path.substr(0, separator);
+    };
+    auto sync_dir = [&](const std::string& directory) {
+      const int fd = ::open(directory.c_str(), O_RDONLY | kOpenBaseFlags);
+      if (fd < 0) return PosixError(directory, errno);
+      Status status;
+      if (::fsync(fd) != 0) {
+        status = PosixError(directory, errno);
+      }
+      (void)::close(fd);
+      return status;
+    };
+
+    const std::string to_dir = dirname(to);
+    Status status = sync_dir(to_dir);
+    const std::string from_dir = dirname(from);
+    if (status.ok() && from_dir != to_dir) {
+      status = sync_dir(from_dir);
+    }
+    if (!status.ok()) return status;
     return Status::OK();
   }
 

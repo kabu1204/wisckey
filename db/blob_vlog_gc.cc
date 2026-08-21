@@ -18,71 +18,115 @@ class ValueLogGCWriteCallback : public WriteCallback {
  public:
   ~ValueLogGCWriteCallback() override = default;
   ValueLogGCWriteCallback(std::string&& key, ValueHandle handle)
-      : key_(key), handle_(handle) {}
+      : key_(std::move(key)), handle_(handle) {}
 
   Status Callback(DB* db) override {
-    Status s;
     std::string value;
-    s = db->Get(ReadOptions(), key_, &value);
+    ValueType value_type = kTypeDeletion;
+    Status s = reinterpret_cast<DBImpl*>(db)->Get(ReadOptions(), key_, &value,
+                                                  &value_type);
     if (!s.ok()) {
-      return s;
+      result_ = s;
+      return result_;
+    }
+    if (value_type != kTypeValueHandle) {
+      result_ = Status::InvalidArgument("KVHandle may be overwritten");
+      return result_;
     }
 
     Slice input(value);
     ValueHandle current;
-    current.DecodeFrom(&input);
+    s = current.DecodeFrom(&input);
+    if (!s.ok() || !input.empty()) {
+      result_ = Status::Corruption("invalid value handle during GC rewrite");
+      return result_;
+    }
     if (current != handle_) {
-      return Status::InvalidArgument("KVHandle may be overwritten");
+      result_ = Status::InvalidArgument("KVHandle may be overwritten");
+      return result_;
     }
 
-    return Status::OK();
+    applied_ = true;
+    result_ = Status::OK();
+    return result_;
   }
 
   bool AllowGrouping() const override { return false; }
 
   Slice key() const { return {key_}; }
 
+  bool applied() const { return applied_; }
+
+  Status result() const { return result_; }
+
  private:
   friend class ValueLogImpl;
 
   std::string key_;
   ValueHandle handle_;
+  bool applied_{false};
+  Status result_;
 };
 
-class RewriteLSMHandler : public ValueBatch::Handler {
+namespace {
+
+constexpr size_t kGCRewriteBatchBytes = 1 << 20;
+
+template <typename Callback>
+class ScopeExit {
  public:
-  ~RewriteLSMHandler() override = default;
+  explicit ScopeExit(Callback callback) : callback_(std::move(callback)) {}
+  ~ScopeExit() { callback_(); }
 
-  bool operator()(const Slice& key, const Slice& value,
-                  ValueHandle handle) override {
-    if (shutdown->load(std::memory_order_acquire)) {
-      s = Status::IOError("ValueLog shutting down during GC rewrite");
-      return false;
-    }
+  ScopeExit(const ScopeExit&) = delete;
+  ScopeExit& operator=(const ScopeExit&) = delete;
 
-    handle.EncodeTo(&handle_encoding);
-    WriteBatchInternal::Put(&iter->first, key, handle_encoding,
-                            kTypeValueHandle);
-    s = db->Write(opt, &iter->first, &iter->second);
-    if (!s.ok()) {
-      s = Status::IOError("failed to write to LSM", s.ToString());
-      return false;
-    }
-    ++iter;
-    if (iter == end) {
-      return false;
-    }
-    return true;
+ private:
+  Callback callback_;
+};
+
+Status GetCurrentValueHandle(DBImpl* db, const Slice& key,
+                             ValueHandle* current, bool* has_handle) {
+  *has_handle = false;
+  std::string handle_encoding;
+  ValueType value_type = kTypeDeletion;
+  Status s = db->Get(ReadOptions(), key, &handle_encoding, &value_type);
+  if (s.IsNotFound()) {
+    return Status::OK();
+  }
+  if (!s.ok()) {
+    return Status::IOError("[GC] failed to read from LSM", s.ToString());
+  }
+  if (value_type != kTypeValueHandle) {
+    return Status::OK();
   }
 
-  std::string handle_encoding;
-  std::vector<std::pair<WriteBatch, ValueLogGCWriteCallback>>::iterator iter;
-  std::vector<std::pair<WriteBatch, ValueLogGCWriteCallback>>::iterator end;
-  WriteOptions opt;
-  std::atomic<bool>* shutdown;
-  DBImpl* db;
-  Status s;
-};
+  Slice input(handle_encoding);
+  s = current->DecodeFrom(&input);
+  if (!s.ok() || !input.empty()) {
+    return Status::Corruption("invalid value handle during GC collection");
+  }
+  *has_handle = true;
+  return Status::OK();
+}
+
+Status IsCurrentValue(DBImpl* db, const Slice& key,
+                      const ValueHandle& expected, bool* is_current) {
+  ValueHandle current;
+  bool has_handle = false;
+  Status s = GetCurrentValueHandle(db, key, &current, &has_handle);
+  if (!s.ok()) {
+    return s;
+  }
+  *is_current = has_handle && current == expected;
+  return Status::OK();
+}
+
+uint64_t DiscardPercent(uint64_t discarded, uint64_t total) {
+  return total == 0 ? 100 : discarded * 100 / total;
+}
+
+}  // namespace
 
 /*
  * TODO: collect several files in one GC
@@ -97,12 +141,10 @@ struct GarbageCollection {
         discard_entries(0) {}
   ~GarbageCollection() = default;
   uint64_t number;
-  ValueBatch value_batch;
-  std::vector<std::pair<WriteBatch, ValueLogGCWriteCallback>> rewrites;
-  uint32_t total_size;
-  uint32_t total_entries;
-  uint32_t discard_size;
-  uint32_t discard_entries;
+  uint64_t total_size;
+  uint64_t total_entries;
+  uint64_t discard_size;
+  uint64_t discard_entries;
   SequenceNumber obsolete_sequence;
   Status s;
 };
@@ -112,10 +154,10 @@ void ValueLogImpl::BGWork(void* vlog) {
 }
 
 /*
- * We have no policy on when to GC and which file to GC, we just select one
- * .vlog file polling and sleep for 10 minutes.
+ * Automatic GC visits one read-only vlog per configured interval. Selection
+ * currently walks file numbers in order.
  *
- * TODO: Maybe the following policies are helpful:
+ * TODO: The following policies may improve source selection:
  *  1. utilize LSM compaction statistics to select file. (deleted/overwritten
  * value handles)
  *  2. sample blob records to get statistics
@@ -144,18 +186,20 @@ void ValueLogImpl::BGCall() {
 void ValueLogImpl::MaybeScheduleGC() {
   mutex_.AssertHeld();
   if (bg_garbage_collection_) {
-    // allow only one GC thread
-    // multiple GC threads is safe in theory, but I don't test :D
+    // Allow only one GC job at a time.
   } else if (shutdown_.load(std::memory_order_acquire)) {
     // shutting down value log
   } else if (!bg_error_.ok() && !bg_error_.IsNonFatal()) {
     // stop
     Log(options_.info_log, "Fatal BGError: %s", bg_error_.ToString().c_str());
   } else {
-    TimePoint now = std::chrono::system_clock::now();
+    TimePoint now = TimePoint::clock::now();
     std::chrono::duration<int> duration =
         std::chrono::duration_cast<std::chrono::seconds>(now - gc_last_run_);
-    if (manual_gc_ || duration.count() > options_.blob_gc_interval) {
+    const bool periodic_gc_due =
+        options_.blob_gc_interval > 0 &&
+        duration.count() >= options_.blob_gc_interval;
+    if (!manual_gc_files_.empty() || periodic_gc_due) {
       bg_garbage_collection_ = true;
       env_->Schedule(&ValueLogImpl::BGWork, this);
     }
@@ -163,41 +207,58 @@ void ValueLogImpl::MaybeScheduleGC() {
 }
 
 void ValueLogImpl::BackgroundGC() {
+  TEST_SYNC_POINT("GC.BeforeBackground");
+
+  bool manual = false;
+  uint64_t requested_number = 0;
+  {
+    MutexLock l(&mutex_);
+    if (!manual_gc_files_.empty()) {
+      manual = true;
+      auto request = manual_gc_files_.begin();
+      requested_number = *request;
+      manual_gc_files_.erase(request);
+    }
+  }
+
   rwlock_.WLock();
   GarbageCollection* gc;
-  if (manual_gc_) {
-    gc = PickGC(manual_gc_number);
-    manual_gc_ = false;
+  if (manual) {
+    gc = PickGC(requested_number);
   } else {
     gc = PickGC(gc_pointer_);
     gc_pointer_ = gc ? gc->number + 1 : 0;
   }
   rwlock_.WUnlock();
 
-  if (!gc) {
-    RecordBGError(Status::NonFatal("Empty GC metadata, skip"));
-    return;
-  }
-
   Status s;
-  s = Collect(gc);
-  if (!s.ok() && !s.IsNonFatal()) {
-    goto OUT;
+  if (!gc) {
+    // This is a normal idle state, not an error. Advancing gc_last_run_ below
+    // prevents BGCall() from immediately scheduling the same empty scan.
+    s = Status::OK();
+  } else {
+    s = Collect(gc);
+    if (s.ok()) {
+      TEST_SYNC_POINT("GC.AfterCollect");
+      s = Rewrite(gc);
+    }
   }
 
-  TEST_SYNC_POINT("GC.AfterCollect");
-
-  s = Rewrite(gc);
-  if (!s.ok() && !s.IsNonFatal()) {
-    goto OUT;
+  if (s.ok() || s.IsNonFatal()) {
+    // Reclaim files whose last possible LSM snapshot has expired. Run this for
+    // idle scans too, so snapshot release does not require another eligible
+    // source file or a foreground write before disk space is reclaimed.
+    WriteLock l(&rwlock_);
+    RemoveObsoleteFiles();
   }
 
   {
     MutexLock l(&mutex_);
-    gc_last_run_ = std::chrono::system_clock::now();
+    // Rate-limit complete GC attempts, including empty scans, threshold misses,
+    // and non-fatal failures. Manual requests still bypass this timestamp.
+    gc_last_run_ = TimePoint::clock::now();
   }
 
-OUT:
   RecordBGError(std::move(s));
   delete gc;
 }
@@ -207,20 +268,23 @@ void ValueLogImpl::RecordBGError(Status&& s) {
   bg_error_ = std::move(s);
 }
 
-/*
- * We not have any policies :)
- * We just pick the first valid vlog whose file_number >= number.
- */
+// Pick the first eligible read-only vlog whose file number is at least number.
 GarbageCollection* ValueLogImpl::PickGC(uint64_t number) {
   rwlock_.AssertRLockHeld();
 
   while (true) {
     auto it = ro_files_.lower_bound(number);
     if (it == ro_files_.end()) {
-      Log(options_.info_log, "PickGC Restart");
+      Log(options_.info_log, "No eligible vlog at or after #%llu",
+          static_cast<unsigned long long>(number));
       return nullptr;
     }
     if (obsolete_files_.find(it->first) == obsolete_files_.end()) {
+      if (pending_publications_.count(it->first) != 0) {
+        deferred_gc_files_.insert(it->first);
+        number = it->first + 1;
+        continue;
+      }
       number = it->first;
       break;
     }
@@ -233,23 +297,100 @@ GarbageCollection* ValueLogImpl::PickGC(uint64_t number) {
 }
 
 void ValueLogImpl::ManualGC(uint64_t number) {
+  MutexLock l(&mutex_);
+  manual_gc_files_.insert(number);
+  MaybeScheduleGC();
+}
+
+Status ValueLogImpl::RunGC() {
+  // Stop/restart of the periodic timer and the finite source snapshot form one
+  // maintenance operation. Concurrent callers must not race on the timer
+  // thread or collect the same sources simultaneously.
+  std::lock_guard<std::mutex> run_lock(run_gc_mutex_);
+  TEST_SYNC_POINT("GC.RunGC.InCriticalSection");
+
+  // Freeze periodic selection while taking the source-file snapshot. This
+  // makes a full maintenance pass visit each file that existed at entry at
+  // most once, and never loops over replacement files created by the pass.
+  StopGCThread();
+  auto restart_gc_timer = [this] { StartGCThread(); };
+  ScopeExit<decltype(restart_gc_timer)> restart_timer(restart_gc_timer);
+
+  Status result;
   {
-    WriteLock l(&rwlock_);
-    manual_gc_ = true;
-    manual_gc_number = number;
+    MutexLock l(&mutex_);
+    while (bg_garbage_collection_) {
+      bg_work_cv_.Wait();
+    }
+    if (!bg_error_.ok() && !bg_error_.IsNonFatal()) {
+      result = bg_error_;
+    }
+  }
+  if (!result.ok()) {
+    return result;
   }
 
-  MutexLock l(&mutex_);
-  MaybeScheduleGC();
+  std::vector<uint64_t> sources;
+  {
+    WriteLock l(&rwlock_);
+    sources.reserve(ro_files_.size());
+    for (const auto& file : ro_files_) {
+      const uint64_t number = file.first;
+      if (obsolete_files_.count(number) != 0) {
+        continue;
+      }
+      if (pending_publications_.count(number) != 0) {
+        deferred_gc_files_.insert(number);
+        continue;
+      }
+      sources.push_back(number);
+    }
+  }
+
+  for (uint64_t number : sources) {
+    {
+      WriteLock l(&rwlock_);
+      if (ro_files_.count(number) == 0 || obsolete_files_.count(number) != 0) {
+        continue;
+      }
+      // A rolled file can still have an unpublished handle batch. Never
+      // collect it until that writer leaves DBImpl's publication queue.
+      if (pending_publications_.count(number) != 0) {
+        deferred_gc_files_.insert(number);
+        continue;
+      }
+    }
+
+    ManualGC(number);
+    {
+      MutexLock l(&mutex_);
+      while (bg_garbage_collection_) {
+        bg_work_cv_.Wait();
+      }
+      if (!bg_error_.ok() && !bg_error_.IsNonFatal()) {
+        result = bg_error_;
+      }
+    }
+    if (!result.ok()) {
+      return result;
+    }
+  }
+
+  {
+    WriteLock l(&rwlock_);
+    RemoveObsoleteFiles();
+  }
+  return Status::OK();
 }
 
 Status ValueLogImpl::Collect(GarbageCollection* gc) {
   ReadLock l(&rwlock_);
   assert(gc != nullptr);
-  Log(options_.info_log, "Collecting old entries in vlog %llu\n", gc->number);
+  Log(options_.info_log, "Collecting old entries in vlog %llu\n",
+      static_cast<unsigned long long>(gc->number));
   Status s;
   uint64_t number = gc->number;
-  if (number >= CurrentFileNumber() || number == 0) {
+  if (number == 0 || ro_files_.find(number) == ro_files_.end()) {
     return Status::NonFatal("invalid file number", std::to_string(number));
   }
 
@@ -264,44 +405,26 @@ Status ValueLogImpl::Collect(GarbageCollection* gc) {
    */
   rwlock_.RUnlock();
 
-  Slice key;
-  ValueType valueType;
-  std::string handle_encoding;
-  ValueHandle handle, current;
-  ValueBatch& vb = gc->value_batch;
-  std::vector<std::pair<WriteBatch, ValueLogGCWriteCallback>>& rewrites =
-      gc->rewrites;
+  ValueHandle current;
   current.table_ = number;
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
-    key = iter->key();
-
-    s = db_->Get(ReadOptions(), key, &handle_encoding, &valueType);
-    if (!s.ok() && !s.IsNotFound()) {
-      s = Status::IOError("[GC] failed to Get from DBImpl", s.ToString());
-      break;
-    }
-
     iter->GetValueHandle(&current);
 
     gc->total_entries++;
     gc->total_size += current.size_;
 
-    if (valueType == kTypeValueHandle) {
-      Slice input(handle_encoding);
-      handle.DecodeFrom(&input);
+    bool is_current = false;
+    s = IsCurrentValue(db_, iter->key(), current, &is_current);
+    if (!s.ok()) {
+      break;
     }
-    if (s.IsNotFound() || valueType != kTypeValueHandle || handle != current) {
+    if (!is_current) {
       gc->discard_entries++;
       gc->discard_size += current.size_;
-      continue;
     }
-
-    /*
-     * We need to keep the entry.
-     */
-    vb.Put(key, iter->value());
-    rewrites.emplace_back(WriteBatch(),
-                          ValueLogGCWriteCallback(key.ToString(), handle));
+  }
+  if (s.ok()) {
+    s = iter->status();
   }
   delete iter;
 
@@ -324,16 +447,27 @@ Status ValueLogImpl::Collect(GarbageCollection* gc) {
 Status ValueLogImpl::Rewrite(GarbageCollection* gc) {
   Status s;
   assert(gc != nullptr);
-  Log(options_.info_log, "Rewriting vlog %llu\n", gc->number);
-  Log(options_.info_log, "[GC #%llu] Size based discard ratio: %u/%u = %d%%",
-      gc->number, gc->discard_size, gc->total_size,
-      (gc->discard_size * 100 / gc->total_size));
-  Log(options_.info_log, "[GC #%llu] Num based discard ratio: %u/%u = %d%%",
-      gc->number, gc->discard_entries, gc->total_entries,
-      (gc->discard_entries * 100 / gc->total_entries));
-  if ((gc->discard_size * 100 / gc->total_size) <
+  Log(options_.info_log, "Rewriting vlog %llu\n",
+      static_cast<unsigned long long>(gc->number));
+  const uint64_t size_discard_percent =
+      DiscardPercent(gc->discard_size, gc->total_size);
+  const uint64_t entry_discard_percent =
+      DiscardPercent(gc->discard_entries, gc->total_entries);
+  Log(options_.info_log,
+      "[GC #%llu] Size based discard ratio: %llu/%llu = %llu%%",
+      static_cast<unsigned long long>(gc->number),
+      static_cast<unsigned long long>(gc->discard_size),
+      static_cast<unsigned long long>(gc->total_size),
+      static_cast<unsigned long long>(size_discard_percent));
+  Log(options_.info_log,
+      "[GC #%llu] Num based discard ratio: %llu/%llu = %llu%%",
+      static_cast<unsigned long long>(gc->number),
+      static_cast<unsigned long long>(gc->discard_entries),
+      static_cast<unsigned long long>(gc->total_entries),
+      static_cast<unsigned long long>(entry_discard_percent));
+  if (static_cast<int>(size_discard_percent) <
           options_.blob_gc_size_discard_threshold &&
-      (gc->discard_entries * 100 / gc->total_entries) <
+      static_cast<int>(entry_discard_percent) <
           options_.blob_gc_num_discard_threshold) {
     return Status::NonFatal(
         "Discarded entries/size does not reach the threshold");
@@ -342,7 +476,14 @@ Status ValueLogImpl::Rewrite(GarbageCollection* gc) {
   if (gc->discard_entries == gc->total_entries) {
     Log(options_.info_log,
         "[GC #%llu] All entries discarded, removing the entire file",
-        gc->number);
+        static_cast<unsigned long long>(gc->number));
+    // The records which made this source stale may be nonsync foreground
+    // overwrites or deletes. Make their vlog data and LSM WAL durable before
+    // the manifest can make the old vlog reclaimable.
+    s = SyncLSM();
+    if (!s.ok()) {
+      return s;
+    }
     gc->obsolete_sequence = db_->LatestSequence();
     BlobVersionEdit edit;
     edit.DeleteFile(gc->number, gc->obsolete_sequence);
@@ -353,8 +494,9 @@ Status ValueLogImpl::Rewrite(GarbageCollection* gc) {
   /*
    * we create another file instead of directly writing to rwfile_
    */
-  AppendableRandomAccessFile* file;
-  VLogBuilder* builder;
+  AppendableRandomAccessFile* file = nullptr;
+  VLogBuilder* builder = nullptr;
+  bool builder_closed = false;
   uint64_t number;
   {
     WriteLock l(&rwlock_);
@@ -367,23 +509,129 @@ Status ValueLogImpl::Rewrite(GarbageCollection* gc) {
     builder = new VLogBuilder(options_, file, false);
     pending_outputs_.emplace(number);
 
-    Log(options_.info_log, "[GC #%llu] Rewriting to vlog#%llu", gc->number,
-        number);
+    Log(options_.info_log, "[GC #%llu] Rewriting to vlog#%llu",
+        static_cast<unsigned long long>(gc->number),
+        static_cast<unsigned long long>(number));
   }
 
-  /*
-   * The valid values that we are rewriting to the new vlog file, are already
-   * persistent. So we need to keep the consistency.
-   */
-  WriteOptions opt;
-  opt.sync = true;
+  // No LSM handle refers to the replacement until it is published below, so
+  // all failures during the value-copy phase can safely discard the output.
+  auto discard_unpublished_output = [&](Status error) {
+    if (builder != nullptr && !builder_closed) {
+      builder->Abandon();
+      builder_closed = true;
+    }
+    if (file != nullptr) {
+      file->Close();
+    }
+    delete builder;
+    delete file;
+    builder = nullptr;
+    file = nullptr;
+    {
+      WriteLock l(&rwlock_);
+      pending_outputs_.erase(number);
+    }
+    env_->RemoveFile(VLogFileName(dbname_, number));
+    return error;
+  };
 
-  // 1. write to ValueLog
-  gc->value_batch.Finalize(number, 0);
-  builder->AddBatch(&gc->value_batch);
-  file->Sync();
-  builder->Finish();
-  file->Close();
+  // Re-read the old file and copy only values which are still current. Values
+  // are accumulated in a bounded batch; unlike the old implementation this
+  // does not retain a whole vlog's live values and WriteCallbacks in memory.
+  VLogReaderIterator* old_iter;
+  {
+    ReadLock l(&rwlock_);
+    old_iter = reinterpret_cast<VLogReaderIterator*>(
+        NewVLogFileIterator(ReadOptions(), gc->number));
+  }
+  if (old_iter == nullptr) {
+    return discard_unpublished_output(
+        Status::NonFatal("invalid file number", std::to_string(gc->number)));
+  }
+
+  ValueBatch batch;
+  ValueHandle old_handle;
+  old_handle.table_ = gc->number;
+  auto flush_batch = [&]() {
+    if (batch.NumEntries() == 0) {
+      return Status::OK();
+    }
+    batch.Finalize(number, builder->Offset());
+    builder->AddBatch(&batch);
+    Status result = builder->status();
+    TEST_SYNC_POINT("GC.Rewrite.AfterBatch");
+    batch = ValueBatch();
+    return result;
+  };
+
+  uint64_t copied_entries = 0;
+  for (old_iter->SeekToFirst(); old_iter->Valid(); old_iter->Next()) {
+    if (shutdown_.load(std::memory_order_acquire)) {
+      s = Status::IOError("ValueLog shutting down during GC value rewrite");
+      break;
+    }
+
+    old_iter->GetValueHandle(&old_handle);
+    bool is_current = false;
+    s = IsCurrentValue(db_, old_iter->key(), old_handle, &is_current);
+    if (!s.ok()) {
+      break;
+    }
+    if (!is_current) {
+      continue;
+    }
+
+    batch.Put(old_iter->key(), old_iter->value());
+    ++copied_entries;
+    if (batch.size() >= kGCRewriteBatchBytes) {
+      s = flush_batch();
+      if (!s.ok()) {
+        break;
+      }
+    }
+  }
+  if (s.ok()) {
+    s = old_iter->status();
+  }
+  if (s.ok()) {
+    s = flush_batch();
+  }
+  delete old_iter;
+  if (!s.ok()) {
+    return discard_unpublished_output(std::move(s));
+  }
+
+  if (copied_entries == 0) {
+    discard_unpublished_output(Status::OK());
+    Log(options_.info_log,
+        "[GC #%llu] All entries became stale during rewrite; removing file",
+        static_cast<unsigned long long>(gc->number));
+    // Entries can become stale after Collect() due to nonsync foreground
+    // writes. Do not durably obsolete their old vlog until those writes are
+    // themselves durable.
+    s = SyncLSM();
+    if (!s.ok()) {
+      return s;
+    }
+    gc->obsolete_sequence = db_->LatestSequence();
+    BlobVersionEdit edit;
+    edit.DeleteFile(gc->number, gc->obsolete_sequence);
+    WriteLock l(&rwlock_);
+    return LogAndApply(&edit);
+  }
+
+  s = builder->Finish();
+  builder_closed = true;
+  if (s.ok()) {
+    s = file->Sync();
+  }
+  if (s.ok()) {
+    s = file->Close();
+  }
+  if (!s.ok()) {
+    return discard_unpublished_output(std::move(s));
+  }
 
   // add file to ro_files in advance
   VLogFileMeta f;
@@ -396,28 +644,87 @@ Status ValueLogImpl::Rewrite(GarbageCollection* gc) {
   }
   delete builder;
   delete file;
+  builder = nullptr;
+  file = nullptr;
 
   TEST_SYNC_POINT_MAY_RETURN("GC.Rewrite.AfterValueRewrite", s);
 
   // 2. rewrite to LSM
-  // we disable sync when writing, and manually sync LSM later
-  Log(options_.info_log, "[GC #%llu] Rewriting to LSM, vlog#%llu", gc->number,
-      number);
+  // We disable sync for each record and sync the LSM WAL once after all
+  // conditional pointer updates. The replacement vlog was synced first.
+  Log(options_.info_log, "[GC #%llu] Rewriting to LSM, vlog#%llu",
+      static_cast<unsigned long long>(gc->number),
+      static_cast<unsigned long long>(number));
+  WriteOptions opt;
   opt.sync = false;
 
-  RewriteLSMHandler handler;
-  handler.shutdown = &shutdown_;
-  handler.iter = gc->rewrites.begin();
-  handler.end = gc->rewrites.end();
-  handler.opt = opt;
-  handler.db = db_;
-
-  s = gc->value_batch.Iterate(&handler);
-  if (!s.ok() || !handler.s.ok()) {
-    return Status::IOError("GC", handler.s.ToString());
+  VLogReaderIterator* new_iter;
+  {
+    ReadLock l(&rwlock_);
+    new_iter = reinterpret_cast<VLogReaderIterator*>(
+        NewVLogFileIterator(ReadOptions(), number));
+  }
+  if (new_iter == nullptr) {
+    return Status::IOError("GC replacement vlog is unavailable");
   }
 
-  s = db_->Sync();
+  ValueHandle new_handle;
+  new_handle.table_ = number;
+  for (new_iter->SeekToFirst(); new_iter->Valid(); new_iter->Next()) {
+    if (shutdown_.load(std::memory_order_acquire)) {
+      s = Status::IOError("ValueLog shutting down during GC LSM rewrite");
+      break;
+    }
+
+    ValueHandle current;
+    bool has_handle = false;
+    s = GetCurrentValueHandle(db_, new_iter->key(), &current, &has_handle);
+    if (!s.ok()) {
+      break;
+    }
+    // The selected source file is read-only. If this key still points into it,
+    // it must point to the record copied above; otherwise a foreground write
+    // has already made the replacement record stale.
+    if (!has_handle || current.table_ != gc->number) {
+      continue;
+    }
+
+    new_iter->GetValueHandle(&new_handle);
+    std::string handle_encoding;
+    new_handle.EncodeTo(&handle_encoding);
+    WriteBatch rewrite;
+    WriteBatchInternal::Put(&rewrite, new_iter->key(), handle_encoding,
+                            kTypeValueHandle);
+    ValueLogGCWriteCallback callback(new_iter->key().ToString(), current);
+    s = db_->Write(opt, &rewrite, &callback);
+    if (!callback.applied() &&
+        (callback.result().IsNotFound() ||
+         callback.result().IsInvalidArgument())) {
+      // A foreground write won the race after our pre-check. DBImpl reports
+      // callback rejection to its caller; for GC this is an expected stale
+      // record and must not abort the rest of the file.
+      s = Status::OK();
+      continue;
+    }
+    if (!s.ok()) {
+      s = Status::IOError("failed to write GC handle to LSM", s.ToString());
+      break;
+    }
+    if (!callback.applied()) {
+      s = Status::IOError("failed to validate GC handle",
+                          callback.result().ToString());
+      break;
+    }
+  }
+  if (s.ok()) {
+    s = new_iter->status();
+  }
+  delete new_iter;
+  if (!s.ok()) {
+    return s;
+  }
+
+  s = SyncLSM();
   if (!s.ok()) {
     return s;
   }

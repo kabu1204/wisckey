@@ -329,6 +329,69 @@ TEST_F(EnvPosixTest, TestCloseOnExecLogger) {
 
 #endif  // HAVE_O_CLOEXEC
 
+TEST_F(EnvPosixTest, AppendableRandomAccessSyncAndGrowth) {
+  std::string test_dir;
+  ASSERT_LEVELDB_OK(env_->GetTestDirectory(&test_dir));
+  const std::string file_path = test_dir + "/appendable_random_access.vlog";
+  if (env_->FileExists(file_path)) {
+    ASSERT_LEVELDB_OK(env_->RemoveFile(file_path));
+  }
+
+  AppendableRandomAccessFile* file = nullptr;
+  ASSERT_LEVELDB_OK(
+      env_->NewAppendableRandomAccessFile(file_path, &file));
+  ASSERT_NE(nullptr, file);
+
+  std::string expected;
+  for (int i = 0; i < 1000; ++i) {
+    const std::string record = std::to_string(i) + std::string(1024, 'a');
+    ASSERT_LEVELDB_OK(file->Append(record));
+    ASSERT_LEVELDB_OK(file->Sync());
+    expected.append(record);
+  }
+
+  // This exceeds the old mmap reservation by more than one doubling and used
+  // to let MAP_FIXED overwrite an unrelated mapping.
+  const std::string large_record(20 << 20, 'z');
+  const uint64_t large_offset = file->Offset();
+  ASSERT_LEVELDB_OK(file->Append(large_record));
+  ASSERT_LEVELDB_OK(file->Sync());
+
+  std::vector<std::string> vector_storage;
+  std::vector<Slice> vector_parts;
+  vector_storage.reserve(3000);
+  vector_parts.reserve(3000);
+  std::string vector_expected;
+  for (int i = 0; i < 3000; ++i) {
+    vector_storage.push_back(std::to_string(i) + ":");
+    vector_parts.emplace_back(vector_storage.back());
+    vector_expected.append(vector_storage.back());
+  }
+  const uint64_t vector_offset = file->Offset();
+  ASSERT_LEVELDB_OK(file->AppendV(vector_parts.data(), vector_parts.size()));
+  ASSERT_LEVELDB_OK(file->Sync());
+
+  char scratch[32];
+  Slice result;
+  ASSERT_LEVELDB_OK(file->Read(large_offset + large_record.size() - 32,
+                               sizeof(scratch), &result, scratch));
+  ASSERT_EQ(std::string(32, 'z'), result.ToString());
+  std::string vector_scratch(vector_expected.size(), '\0');
+  ASSERT_LEVELDB_OK(file->Read(vector_offset, vector_expected.size(), &result,
+                               &vector_scratch[0]));
+  ASSERT_EQ(vector_expected, result.ToString());
+  ASSERT_EQ(expected.size() + large_record.size() + vector_expected.size(),
+            file->Offset());
+  ASSERT_LEVELDB_OK(file->Close());
+  delete file;
+
+  uint64_t file_size = 0;
+  ASSERT_LEVELDB_OK(env_->GetFileSize(file_path, &file_size));
+  ASSERT_EQ(expected.size() + large_record.size() + vector_expected.size(),
+            file_size);
+  ASSERT_LEVELDB_OK(env_->RemoveFile(file_path));
+}
+
 }  // namespace leveldb
 
 int main(int argc, char** argv) {
