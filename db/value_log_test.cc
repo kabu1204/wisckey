@@ -103,6 +103,24 @@ static void ExpectIteratorEntry(Iterator* iter, int index) {
   EXPECT_EQ(IteratorValue(index), iter->value().ToString());
 }
 
+static std::vector<uint64_t> ReadOnlyVLogNumbers(Env* env,
+                                                  const std::string& dbname) {
+  std::vector<std::string> children;
+  EXPECT_TRUE(env->GetChildren(dbname, &children).ok());
+  std::set<uint64_t> numbers;
+  for (const std::string& child : children) {
+    uint64_t number = 0;
+    FileType type;
+    if (ParseFileName(child, &number, &type) && type == kVLogFile) {
+      numbers.insert(number);
+    }
+  }
+  if (!numbers.empty()) {
+    numbers.erase(*numbers.rbegin());  // current writable vlog
+  }
+  return {numbers.begin(), numbers.end()};
+}
+
 TEST(VLOG_TEST, DBWrapperPrefetchEmptyIterator) {
   Options options;
   options.create_if_missing = true;
@@ -698,6 +716,7 @@ TEST(VLOG_TEST, DBWrapperRunGCVisitsInitialFilesOnce) {
   options.blob_gc_size_discard_threshold = 20;
   options.blob_gc_num_discard_threshold = 20;
   options.blob_gc_interval = 0;
+  options.blob_max_background_gc = 2;
   const std::string dbname("testdb_gc_full_pass");
   CleanDir(options.env, dbname);
 
@@ -867,6 +886,404 @@ TEST(VLOG_TEST, DBWrapperConcurrentRunGCSerializesAndRestartsTimer) {
   CleanDir(options.env, dbname);
 }
 
+TEST(VLOG_TEST, BackgroundGCParallelismOptionValidation) {
+  Options options;
+  options.create_if_missing = true;
+  options.blob_gc_interval = 0;
+  const std::string dbname("testdb_gc_parallel_option");
+  CleanDir(options.env, dbname);
+
+  BlobDB* db = nullptr;
+  options.blob_max_background_gc = 0;
+  EXPECT_TRUE(BlobDB::Open(options, dbname, &db).IsInvalidArgument());
+  EXPECT_EQ(nullptr, db);
+
+  options.blob_max_background_gc = 3;
+  EXPECT_TRUE(BlobDB::Open(options, dbname, &db).IsInvalidArgument());
+  EXPECT_EQ(nullptr, db);
+
+  options.blob_max_background_gc = 1;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, BackgroundGCParallelismGuard) {
+  EXPECT_FALSE(CanRunVLogGCConcurrently(0, 3));
+  EXPECT_FALSE(CanRunVLogGCConcurrently(3, 0));
+  EXPECT_FALSE(CanRunVLogGCConcurrently(3, 3));
+  EXPECT_TRUE(CanRunVLogGCConcurrently(3, 4));
+}
+
+TEST(VLOG_TEST, DBWrapperRunsDistinctGCFilesInParallel) {
+  REQUIRE_TEST_SYNC_POINTS();
+  ScopedGCSyncPoints sync_points;
+  Options options;
+  options.create_if_missing = true;
+  options.blob_max_file_size = 32 << 10;
+  options.blob_value_size_threshold = 256;
+  options.blob_gc_size_discard_threshold = 0;
+  options.blob_gc_num_discard_threshold = 0;
+  options.blob_gc_interval = 0;
+  options.blob_max_background_gc = 2;
+  const std::string dbname("testdb_gc_parallel_distinct");
+  CleanDir(options.env, dbname);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  const std::string value(8 << 10, 'v');
+  for (int i = 0; i < 16; ++i) {
+    ASSERT_TRUE(db->Put(WriteOptions(), "key" + std::to_string(i), value).ok());
+  }
+
+  std::vector<std::string> children;
+  ASSERT_TRUE(options.env->GetChildren(dbname, &children).ok());
+  std::set<uint64_t> file_numbers;
+  for (const std::string& child : children) {
+    uint64_t number = 0;
+    FileType type;
+    if (ParseFileName(child, &number, &type) && type == kVLogFile) {
+      file_numbers.insert(number);
+    }
+  }
+  ASSERT_GE(file_numbers.size(), 3U);
+  file_numbers.erase(*file_numbers.rbegin());  // current writable vlog
+  auto source = file_numbers.begin();
+  const uint64_t first = *source++;
+  const uint64_t second = *source;
+
+  struct ConcurrentGC {
+    std::atomic<int> calls{0};
+    std::atomic<int> active{0};
+    std::atomic<int> max_active{0};
+    std::atomic<bool> release{false};
+  } state;
+  auto block_both = +[](void* arg) {
+    auto* state = reinterpret_cast<ConcurrentGC*>(arg);
+    state->calls.fetch_add(1, std::memory_order_release);
+    const int active =
+        state->active.fetch_add(1, std::memory_order_acq_rel) + 1;
+    int maximum = state->max_active.load(std::memory_order_relaxed);
+    while (maximum < active &&
+           !state->max_active.compare_exchange_weak(
+               maximum, active, std::memory_order_relaxed)) {
+    }
+    while (!state->release.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    state->active.fetch_sub(1, std::memory_order_acq_rel);
+    return false;
+  };
+  TEST_SYNC_POINT_ARG("GC.BeforeBackground", &state);
+  TEST_SYNC_POINT_CALLBACK("GC.BeforeBackground", block_both);
+
+  db->ManualGC(first);
+  db->ManualGC(second);
+  for (int i = 0;
+       i < 5000 && state.calls.load(std::memory_order_acquire) < 2; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_EQ(2, state.calls.load(std::memory_order_acquire));
+  EXPECT_EQ(2, state.max_active.load(std::memory_order_acquire));
+
+  state.release.store(true, std::memory_order_release);
+  db->WaitVLogGC();
+  EXPECT_TRUE(db->VLogBGError().ok()) << db->VLogBGError().ToString();
+
+  TEST_SYNC_POINT_CLEAR("GC.BeforeBackground");
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, DBWrapperQueuesDuplicateActiveGCSource) {
+  REQUIRE_TEST_SYNC_POINTS();
+  ScopedGCSyncPoints sync_points;
+  Options options;
+  options.create_if_missing = true;
+  options.blob_max_file_size = 32 << 10;
+  options.blob_value_size_threshold = 256;
+  options.blob_gc_size_discard_threshold = 100;
+  options.blob_gc_num_discard_threshold = 100;
+  options.blob_gc_interval = 0;
+  options.blob_max_background_gc = 2;
+  const std::string dbname("testdb_gc_parallel_duplicate_source");
+  CleanDir(options.env, dbname);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  const std::string value(8 << 10, 'v');
+  for (int i = 0; i < 16; ++i) {
+    ASSERT_TRUE(db->Put(WriteOptions(), "key" + std::to_string(i), value).ok());
+  }
+  const std::vector<uint64_t> sources =
+      ReadOnlyVLogNumbers(options.env, dbname);
+  ASSERT_GE(sources.size(), 2U);
+
+  struct BlockingGC {
+    std::atomic<int> calls{0};
+    std::atomic<int> active{0};
+    std::atomic<int> max_active{0};
+    std::atomic<bool> first_entered{false};
+    std::atomic<bool> release_first{false};
+  } state;
+  auto block_first = +[](void* arg) {
+    auto* state = reinterpret_cast<BlockingGC*>(arg);
+    const int active =
+        state->active.fetch_add(1, std::memory_order_acq_rel) + 1;
+    int maximum = state->max_active.load(std::memory_order_relaxed);
+    while (maximum < active &&
+           !state->max_active.compare_exchange_weak(
+               maximum, active, std::memory_order_relaxed)) {
+    }
+    const int call = state->calls.fetch_add(1, std::memory_order_acq_rel);
+    if (call == 0) {
+      state->first_entered.store(true, std::memory_order_release);
+      while (!state->release_first.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+    }
+    state->active.fetch_sub(1, std::memory_order_acq_rel);
+    return false;
+  };
+  TEST_SYNC_POINT_ARG("GC.BeforeBackground", &state);
+  TEST_SYNC_POINT_CALLBACK("GC.BeforeBackground", block_first);
+
+  db->ManualGC(sources[0]);
+  for (int i = 0;
+       i < 5000 && !state.first_entered.load(std::memory_order_acquire); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(state.first_entered.load(std::memory_order_acquire));
+
+  db->ManualGC(sources[0]);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_EQ(1, state.calls.load(std::memory_order_acquire));
+  EXPECT_EQ(1, state.max_active.load(std::memory_order_acquire));
+
+  state.release_first.store(true, std::memory_order_release);
+  db->WaitVLogGC();
+  EXPECT_EQ(2, state.calls.load(std::memory_order_acquire));
+  EXPECT_EQ(1, state.max_active.load(std::memory_order_acquire));
+
+  TEST_SYNC_POINT_CLEAR("GC.BeforeBackground");
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, DBWrapperRunGCUsesTwoWorkers) {
+  REQUIRE_TEST_SYNC_POINTS();
+  ScopedGCSyncPoints sync_points;
+  Options options;
+  options.create_if_missing = true;
+  options.blob_max_file_size = 32 << 10;
+  options.blob_value_size_threshold = 256;
+  options.blob_gc_size_discard_threshold = 100;
+  options.blob_gc_num_discard_threshold = 100;
+  options.blob_gc_interval = 0;
+  options.blob_max_background_gc = 2;
+  const std::string dbname("testdb_gc_parallel_full_pass");
+  CleanDir(options.env, dbname);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  const std::string value(8 << 10, 'v');
+  for (int i = 0; i < 16; ++i) {
+    ASSERT_TRUE(db->Put(WriteOptions(), "key" + std::to_string(i), value).ok());
+  }
+  ASSERT_GE(ReadOnlyVLogNumbers(options.env, dbname).size(), 2U);
+
+  struct BlockingGC {
+    std::atomic<int> calls{0};
+    std::atomic<int> active{0};
+    std::atomic<int> max_active{0};
+    std::atomic<bool> release{false};
+  } state;
+  auto block_initial_jobs = +[](void* arg) {
+    auto* state = reinterpret_cast<BlockingGC*>(arg);
+    state->calls.fetch_add(1, std::memory_order_release);
+    const int active =
+        state->active.fetch_add(1, std::memory_order_acq_rel) + 1;
+    int maximum = state->max_active.load(std::memory_order_relaxed);
+    while (maximum < active &&
+           !state->max_active.compare_exchange_weak(
+               maximum, active, std::memory_order_relaxed)) {
+    }
+    while (!state->release.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    state->active.fetch_sub(1, std::memory_order_acq_rel);
+    return false;
+  };
+  TEST_SYNC_POINT_ARG("GC.BeforeBackground", &state);
+  TEST_SYNC_POINT_CALLBACK("GC.BeforeBackground", block_initial_jobs);
+
+  Status run_status;
+  std::thread runner([&] { run_status = db->RunVLogGC(); });
+  for (int i = 0;
+       i < 5000 && state.calls.load(std::memory_order_acquire) < 2; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_EQ(2, state.calls.load(std::memory_order_acquire));
+  EXPECT_EQ(2, state.max_active.load(std::memory_order_acquire));
+  state.release.store(true, std::memory_order_release);
+  runner.join();
+  EXPECT_TRUE(run_status.ok()) << run_status.ToString();
+
+  TEST_SYNC_POINT_CLEAR("GC.BeforeBackground");
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, ParallelGCPreservesForegroundWritesAndSnapshot) {
+  REQUIRE_TEST_SYNC_POINTS();
+  ScopedGCSyncPoints sync_points;
+  Options options;
+  options.create_if_missing = true;
+  options.blob_max_file_size = 24 << 10;
+  options.blob_value_size_threshold = 256;
+  options.blob_gc_size_discard_threshold = 0;
+  options.blob_gc_num_discard_threshold = 0;
+  options.blob_gc_interval = 0;
+  options.blob_max_background_gc = 2;
+  const std::string dbname("testdb_gc_parallel_foreground_snapshot");
+  CleanDir(options.env, dbname);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  const std::string old_value(8 << 10, 'o');
+  constexpr int kEntries = 12;
+  for (int i = 0; i < kEntries; ++i) {
+    ASSERT_TRUE(db->Put(WriteOptions(), "key" + std::to_string(i), old_value)
+                    .ok());
+  }
+  const std::vector<uint64_t> sources =
+      ReadOnlyVLogNumbers(options.env, dbname);
+  ASSERT_GE(sources.size(), 2U);
+  const Snapshot* snapshot = db->GetSnapshot();
+
+  struct ForegroundMutation {
+    BlobDB* db;
+    std::atomic<int> calls{0};
+    Status status;
+  } mutation;
+  mutation.db = db;
+  auto mutate_after_collect = +[](void* arg) {
+    auto* mutation = reinterpret_cast<ForegroundMutation*>(arg);
+    if (mutation->calls.fetch_add(1, std::memory_order_acq_rel) != 0) {
+      return false;
+    }
+    for (int i = 0; i < kEntries; ++i) {
+      Status s = i % 2 == 0
+                     ? mutation->db->Put(WriteOptions(),
+                                         "key" + std::to_string(i),
+                                         "new-" + std::to_string(i))
+                     : mutation->db->Delete(WriteOptions(),
+                                            "key" + std::to_string(i));
+      if (!s.ok()) {
+        mutation->status = s;
+        break;
+      }
+    }
+    return false;
+  };
+  TEST_SYNC_POINT_ARG("GC.AfterCollect", &mutation);
+  TEST_SYNC_POINT_CALLBACK("GC.AfterCollect", mutate_after_collect);
+
+  db->ManualGC(sources[0]);
+  db->ManualGC(sources[1]);
+  db->WaitVLogGC();
+  EXPECT_TRUE(mutation.status.ok()) << mutation.status.ToString();
+  ASSERT_GE(mutation.calls.load(std::memory_order_acquire), 1);
+
+  ReadOptions snapshot_read;
+  snapshot_read.snapshot = snapshot;
+  std::string value;
+  ASSERT_TRUE(db->Get(snapshot_read, "key0", &value).ok());
+  EXPECT_EQ(old_value, value);
+  for (size_t i = 0; i < 2; ++i) {
+    EXPECT_TRUE(options.env->FileExists(VLogFileName(dbname, sources[i])));
+  }
+
+  db->ReleaseSnapshot(snapshot);
+  db->RemoveObsoleteBlob();
+  for (size_t i = 0; i < 2; ++i) {
+    EXPECT_FALSE(options.env->FileExists(VLogFileName(dbname, sources[i])));
+  }
+  for (int i = 0; i < kEntries; ++i) {
+    Status s = db->Get(ReadOptions(), "key" + std::to_string(i), &value);
+    if (i % 2 == 0) {
+      ASSERT_TRUE(s.ok()) << s.ToString();
+      EXPECT_EQ("new-" + std::to_string(i), value);
+    } else {
+      EXPECT_TRUE(s.IsNotFound()) << s.ToString();
+    }
+  }
+
+  TEST_SYNC_POINT_CLEAR("GC.AfterCollect");
+  delete db;
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, ParallelGCShutdownWaitsForBothWorkers) {
+  REQUIRE_TEST_SYNC_POINTS();
+  ScopedGCSyncPoints sync_points;
+  Options options;
+  options.create_if_missing = true;
+  options.blob_max_file_size = 32 << 10;
+  options.blob_value_size_threshold = 256;
+  options.blob_gc_interval = 0;
+  options.blob_max_background_gc = 2;
+  const std::string dbname("testdb_gc_parallel_shutdown");
+  CleanDir(options.env, dbname);
+
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  const std::string value(8 << 10, 'v');
+  for (int i = 0; i < 16; ++i) {
+    ASSERT_TRUE(db->Put(WriteOptions(), "key" + std::to_string(i), value).ok());
+  }
+  const std::vector<uint64_t> sources =
+      ReadOnlyVLogNumbers(options.env, dbname);
+  ASSERT_GE(sources.size(), 2U);
+
+  struct BlockingGC {
+    std::atomic<int> calls{0};
+    std::atomic<bool> release{false};
+  } state;
+  auto block_workers = +[](void* arg) {
+    auto* state = reinterpret_cast<BlockingGC*>(arg);
+    state->calls.fetch_add(1, std::memory_order_release);
+    while (!state->release.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    return false;
+  };
+  TEST_SYNC_POINT_ARG("GC.BeforeBackground", &state);
+  TEST_SYNC_POINT_CALLBACK("GC.BeforeBackground", block_workers);
+
+  db->ManualGC(sources[0]);
+  db->ManualGC(sources[1]);
+  for (int i = 0;
+       i < 5000 && state.calls.load(std::memory_order_acquire) < 2; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_EQ(2, state.calls.load(std::memory_order_acquire));
+
+  std::atomic<bool> deleted{false};
+  std::thread destroyer([&] {
+    delete db;
+    deleted.store(true, std::memory_order_release);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_FALSE(deleted.load(std::memory_order_acquire));
+  state.release.store(true, std::memory_order_release);
+  destroyer.join();
+  EXPECT_TRUE(deleted.load(std::memory_order_acquire));
+
+  TEST_SYNC_POINT_CLEAR("GC.BeforeBackground");
+  CleanDir(options.env, dbname);
+}
+
 TEST(VLOG_TEST, DBWrapperManualGCQueuesDistinctFiles) {
   REQUIRE_TEST_SYNC_POINTS();
   ScopedGCSyncPoints sync_points;
@@ -939,6 +1356,8 @@ TEST(VLOG_TEST, DBWrapperManualGCQueuesDistinctFiles) {
   // it; a coalescing set drains all three in separate jobs.
   db->ManualGC(second);
   db->ManualGC(third);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_EQ(1, state.calls.load(std::memory_order_relaxed));
   state.release_first.store(true, std::memory_order_release);
   db->WaitVLogGC();
 
@@ -1138,6 +1557,65 @@ TEST(VLOG_TEST, DBWrapperPeriodicGCWithoutForegroundRollover) {
 
   delete db;
   TEST_SYNC_POINT_CLEAR("GC.BeforeBackground");
+  CleanDir(options.env, dbname);
+}
+
+TEST(VLOG_TEST, PeriodicGCFillsTwoWorkerEpoch) {
+  REQUIRE_TEST_SYNC_POINTS();
+  ScopedGCSyncPoints sync_points;
+  Options options;
+  options.create_if_missing = true;
+  options.blob_max_file_size = 32 << 10;
+  options.blob_value_size_threshold = 256;
+  options.blob_gc_size_discard_threshold = 100;
+  options.blob_gc_num_discard_threshold = 100;
+  options.blob_gc_interval = 1;
+  options.blob_max_background_gc = 2;
+  const std::string dbname("testdb_gc_periodic_parallel_epoch");
+  CleanDir(options.env, dbname);
+
+  struct PeriodicWorkers {
+    std::atomic<int> calls{0};
+    std::atomic<int> active{0};
+    std::atomic<int> max_active{0};
+    std::atomic<bool> release{false};
+  } state;
+  auto block_periodic_workers = +[](void* arg) {
+    auto* state = reinterpret_cast<PeriodicWorkers*>(arg);
+    state->calls.fetch_add(1, std::memory_order_release);
+    const int active =
+        state->active.fetch_add(1, std::memory_order_acq_rel) + 1;
+    int maximum = state->max_active.load(std::memory_order_relaxed);
+    while (maximum < active &&
+           !state->max_active.compare_exchange_weak(
+               maximum, active, std::memory_order_relaxed)) {
+    }
+    while (!state->release.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    state->active.fetch_sub(1, std::memory_order_acq_rel);
+    return false;
+  };
+  BlobDB* db = nullptr;
+  ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+  const std::string value(8 << 10, 'v');
+  for (int i = 0; i < 16; ++i) {
+    ASSERT_TRUE(db->Put(WriteOptions(), "key" + std::to_string(i), value).ok());
+  }
+  ASSERT_GE(ReadOnlyVLogNumbers(options.env, dbname).size(), 2U);
+  TEST_SYNC_POINT_ARG("GC.BeforeBackground", &state);
+  TEST_SYNC_POINT_CALLBACK("GC.BeforeBackground", block_periodic_workers);
+  for (int i = 0;
+       i < 500 && state.calls.load(std::memory_order_acquire) < 2; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_EQ(2, state.calls.load(std::memory_order_acquire));
+  EXPECT_EQ(2, state.max_active.load(std::memory_order_acquire));
+  state.release.store(true, std::memory_order_release);
+  db->WaitVLogGC();
+
+  TEST_SYNC_POINT_CLEAR("GC.BeforeBackground");
+  delete db;
   CleanDir(options.env, dbname);
 }
 
@@ -1706,6 +2184,20 @@ class BlockingLogEnv : public EnvWrapper {
     return Status::OK();
   }
 
+  Status NewAppendableRandomAccessFile(
+      const std::string& filename,
+      AppendableRandomAccessFile** result) override {
+    AppendableRandomAccessFile* target_file = nullptr;
+    Status s =
+        target()->NewAppendableRandomAccessFile(filename, &target_file);
+    if (!s.ok()) {
+      *result = nullptr;
+      return s;
+    }
+    *result = new VLogFile(this, target_file);
+    return Status::OK();
+  }
+
   void BlockNextLogAppend() {
     append_blocked_.store(false, std::memory_order_release);
     release_append_.store(false, std::memory_order_release);
@@ -1729,6 +2221,10 @@ class BlockingLogEnv : public EnvWrapper {
 
   void FailNextLogSync() {
     fail_next_sync_.store(true, std::memory_order_release);
+  }
+
+  void FailNextVLogSync() {
+    fail_next_vlog_sync_.store(true, std::memory_order_release);
   }
 
   void FailLogAppendAfterSuccessOnCall(int call) {
@@ -1770,6 +2266,43 @@ class BlockingLogEnv : public EnvWrapper {
   }
 
  private:
+  class VLogFile : public AppendableRandomAccessFile {
+   public:
+    VLogFile(BlockingLogEnv* env, AppendableRandomAccessFile* target)
+        : env_(env), target_(target) {}
+    ~VLogFile() override { delete target_; }
+
+    Status Read(uint64_t offset, size_t n, Slice* result,
+                char* scratch) const override {
+      return target_->Read(offset, n, result, scratch);
+    }
+    Status Append(const Slice& data) override { return target_->Append(data); }
+    Status AppendV(const Slice* parts, size_t count) override {
+      return target_->AppendV(parts, count);
+    }
+    Status WriteAtV(uint64_t offset, const Slice* parts,
+                    size_t count) override {
+      return target_->WriteAtV(offset, parts, count);
+    }
+    Status Truncate(uint64_t size) override {
+      return target_->Truncate(size);
+    }
+    Status Close() override { return target_->Close(); }
+    Status Flush() override { return target_->Flush(); }
+    Status Sync() override {
+      if (env_->fail_next_vlog_sync_.exchange(false,
+                                               std::memory_order_acq_rel)) {
+        return Status::IOError("injected vlog sync error");
+      }
+      return target_->Sync();
+    }
+    uint64_t Offset() override { return target_->Offset(); }
+
+   private:
+    BlockingLogEnv* const env_;
+    AppendableRandomAccessFile* const target_;
+  };
+
   class ManifestFile : public WritableFile {
    public:
     ManifestFile(BlockingLogEnv* env, WritableFile* target)
@@ -1897,6 +2430,7 @@ class BlockingLogEnv : public EnvWrapper {
   std::atomic<int> log_file_creations_{0};
   std::atomic<bool> closed_dirty_log_{false};
   std::atomic<bool> fail_next_sync_{false};
+  std::atomic<bool> fail_next_vlog_sync_{false};
   std::atomic<bool> fail_next_manifest_sync_{false};
   std::atomic<int> fail_append_countdown_{0};
   std::atomic<bool> fail_append_as_invalid_argument_{false};
@@ -1912,6 +2446,119 @@ void WaitForWriterQueueSize(DBImpl* db, size_t expected) {
 }
 
 }  // namespace
+
+TEST(VLOG_TEST, ParallelGCFaultStagesDoNotStrandOtherWorker) {
+  REQUIRE_TEST_SYNC_POINTS();
+  ScopedGCSyncPoints sync_points;
+  enum class FailureStage { kReplacementSync, kLSMSync, kManifestSync };
+  const std::vector<std::pair<FailureStage, std::string>> stages = {
+      {FailureStage::kReplacementSync, "replacement"},
+      {FailureStage::kLSMSync, "lsm"},
+      {FailureStage::kManifestSync, "manifest"},
+  };
+
+  for (const auto& stage : stages) {
+    SCOPED_TRACE(stage.second);
+    BlockingLogEnv env(Env::Default());
+    Options options;
+    options.env = &env;
+    options.create_if_missing = true;
+    options.blob_max_file_size = 32 << 10;
+    options.blob_value_size_threshold = 256;
+    options.blob_gc_size_discard_threshold = 0;
+    options.blob_gc_num_discard_threshold = 0;
+    options.blob_gc_interval = 0;
+    options.blob_max_background_gc = 2;
+    const std::string dbname =
+        "testdb_gc_parallel_" + stage.second + "_failure";
+    CleanDir(options.env, dbname);
+
+    BlobDB* db = nullptr;
+    ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+    const std::string value(8 << 10, 'v');
+    for (int i = 0; i < 16; ++i) {
+      ASSERT_TRUE(
+          db->Put(WriteOptions(), "key" + std::to_string(i), value).ok());
+    }
+    const std::vector<uint64_t> sources =
+        ReadOnlyVLogNumbers(options.env, dbname);
+    ASSERT_GE(sources.size(), 2U);
+
+    struct SyncFailure {
+      BlockingLogEnv* env;
+      FailureStage stage;
+      std::atomic<int> collected{0};
+      std::atomic<int> lsm_synced{0};
+      std::atomic<bool> release_second{false};
+    } failure;
+    failure.env = &env;
+    failure.stage = stage.first;
+    auto coordinate_collect = +[](void* arg) {
+      auto* failure = reinterpret_cast<SyncFailure*>(arg);
+      const int collected =
+          failure->collected.fetch_add(1, std::memory_order_acq_rel) + 1;
+      if (failure->stage == FailureStage::kReplacementSync) {
+        if (collected == 2) {
+          failure->env->FailNextVLogSync();
+          failure->release_second.store(true, std::memory_order_release);
+        }
+        while (!failure->release_second.load(std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
+      } else if (collected == 2) {
+        while (!failure->release_second.load(std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
+      }
+      return false;
+    };
+    auto inject_later_failure = +[](void* arg) {
+      auto* failure = reinterpret_cast<SyncFailure*>(arg);
+      const int synced =
+          failure->lsm_synced.fetch_add(1, std::memory_order_acq_rel) + 1;
+      if (synced == 1) {
+        if (failure->stage == FailureStage::kLSMSync) {
+          failure->env->FailNextLogSync();
+        } else if (failure->stage == FailureStage::kManifestSync) {
+          failure->env->FailNextVLogManifestSyncAfterSuccess();
+        }
+        failure->release_second.store(true, std::memory_order_release);
+      }
+      return false;
+    };
+    TEST_SYNC_POINT_ARG("GC.AfterCollect", &failure);
+    TEST_SYNC_POINT_CALLBACK("GC.AfterCollect", coordinate_collect);
+    TEST_SYNC_POINT_ARG("GC.Rewrite.AfterLSMRewrite", &failure);
+    TEST_SYNC_POINT_CALLBACK("GC.Rewrite.AfterLSMRewrite",
+                             inject_later_failure);
+
+    db->ManualGC(sources[0]);
+    db->ManualGC(sources[1]);
+    db->WaitVLogGC();
+    EXPECT_EQ(2, failure.collected.load(std::memory_order_acquire));
+    const int expected_lsm_synced =
+        stage.first == FailureStage::kManifestSync ? 2 : 1;
+    EXPECT_EQ(expected_lsm_synced,
+              failure.lsm_synced.load(std::memory_order_acquire));
+    EXPECT_TRUE(db->VLogBGError().IsIOError())
+        << db->VLogBGError().ToString();
+
+    TEST_SYNC_POINT_CLEAR("GC.AfterCollect");
+    TEST_SYNC_POINT_CLEAR("GC.Rewrite.AfterLSMRewrite");
+    delete db;
+    db = nullptr;
+    ASSERT_TRUE(BlobDB::Open(options, dbname, &db).ok());
+    std::string read;
+    for (int i = 0; i < 16; ++i) {
+      ASSERT_TRUE(
+          db->Get(ReadOptions(), "key" + std::to_string(i), &read).ok());
+      EXPECT_EQ(value, read);
+    }
+
+    delete db;
+    CleanDir(options.env, dbname);
+  }
+}
 
 TEST(DBIMPL_TEST, WriteCallback) {
   Options options;

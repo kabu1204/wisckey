@@ -343,7 +343,6 @@ ValueLogImpl::ValueLogImpl(const Options& options, const std::string& dbname,
       manifest_log_(nullptr),
       vlog_file_number_(0),
       manifest_number_(0),
-      bg_garbage_collection_(false),
       bg_work_cv_(&mutex_),
       gc_pointer_(0),
       gc_last_run_(TimePoint::clock::now()) {}
@@ -899,7 +898,8 @@ void ValueLogImpl::StopBackgroundWork() {
   StopGCThread();
   mutex_.Lock();
   shutdown_.store(true, std::memory_order_release);
-  while (bg_garbage_collection_) bg_work_cv_.Wait();
+  manual_gc_files_.clear();
+  while (bg_gc_jobs_ != 0) bg_work_cv_.Wait();
   mutex_.Unlock();
 }
 
@@ -1255,6 +1255,7 @@ void ValueLogImpl::RemoveObsoleteFiles() {
           const bool publication_pending = HasPendingPublication(number);
           keep = ro_files_.find(number) != ro_files_.end() ||
                  pending_outputs_.find(number) != pending_outputs_.end() ||
+                 active_gc_files_.find(number) != active_gc_files_.end() ||
                  publication_pending ||
                  (rwfile_ && number == rwfile_->FileNumber());
           if (!keep) {

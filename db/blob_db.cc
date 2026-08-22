@@ -782,6 +782,11 @@ Status BlobDB::Open(const Options& options, const std::string& name,
     return Status::InvalidArgument(
         "blob_background_read_threads must not be negative");
   }
+  if (options.blob_max_background_gc < 1 ||
+      options.blob_max_background_gc > 2) {
+    return Status::InvalidArgument(
+        "blob_max_background_gc must be either 1 or 2");
+  }
   Log(options.info_log,
       "Creating BlobDB, "
       "ValueThreshold = %lu\n\t"
@@ -789,10 +794,12 @@ Status BlobDB::Open(const Options& options, const std::string& name,
       "BlobGCSizeDiscardThreshold = %d\n\t"
       "BlobGCNumDiscardThreshold = %d\n\t"
       "BlobGCInterval = %d\n\t"
+      "BlobMaxBackgroundGC = %d\n\t"
       "BlobBackgroundReadThreads = %d",
       options.blob_value_size_threshold, options.blob_max_file_size,
       options.blob_gc_size_discard_threshold,
       options.blob_gc_num_discard_threshold, options.blob_gc_interval,
+      options.blob_max_background_gc,
       options.blob_background_read_threads);
   Status s;
   DB* db;
@@ -806,8 +813,9 @@ Status BlobDB::Open(const Options& options, const std::string& name,
     delete db;
     return s;
   }
-  const int desired_background_threads =
-      options.blob_background_read_threads + 2;  // LSM, vlog GC, prefetch
+  const int desired_background_threads = options.blob_background_read_threads +
+                                         1 +  // LSM compaction
+                                         options.blob_max_background_gc;
   options.env->SetPoolBackgroundThreads(std::max(
       options.env->GetPoolBackgroundThreads(), desired_background_threads));
   BlobDB* dbWrapper = new BlobDB(options, name, db, vlog);
@@ -840,7 +848,7 @@ void BlobDB::RemoveObsoleteBlob() {
 
 void BlobDB::WaitVLogGC() {
   MutexLock l(&vlog_->mutex_);
-  while (vlog_->bg_garbage_collection_) {
+  while (vlog_->bg_gc_jobs_ != 0 || !vlog_->manual_gc_files_.empty()) {
     vlog_->bg_work_cv_.Wait();
   }
 }

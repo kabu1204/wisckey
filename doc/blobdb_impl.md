@@ -189,7 +189,12 @@ ValueLog will reuse it instead of creating a new one.
 
 ## Garbage collection
 
-Every blob_gc_interval seconds, the GC thread will pick a read-only .vlog file to perform GC.
+Every `blob_gc_interval` seconds, the GC scheduler picks read-only `.vlog`
+files to perform GC. `blob_max_background_gc` controls the number of workers:
+the default is one, and setting it to two permits two distinct source files to
+be collected concurrently. A source is reserved before its job is queued, so
+the same file is never collected by two workers at once. Vlog manifest updates
+remain serialized.
 
 GC can be divided into two stages: collect and rewrite.
 
@@ -219,14 +224,21 @@ There are 2 points to be aware:
 1. User may update between collect stage and rewrite stage.
 2. User may still read from old file because of the snapshot.
 
-For the first, we need to final check if the record is overwritten just
-before LSM write to WAL and MemTable. To realize this, I modified DBImpl
-to support WriteCallback and WriterGroup (similar to RocksDB)
+For the first, we finally compare the complete old `ValueHandle` immediately
+before the LSM write reaches WAL and MemTable. The conditional update is
+applied only when the current handle still matches. This prevents either a
+foreground write or another GC job from reviving an older value. DBImpl
+supports this through WriteCallback and WriterGroup (similar to RocksDB).
 
 For the second, the user may hold an old snapshot and can read an old vptr pointing
 to the old file. To address this, we just mark the old file as obsoleted. Later, when the
 smallest_snapshot of LSMTree is larger than the newest SequenceNumber of records in the old
 file, we can remove the old file from disk safely.
+
+The replacement vlog is synced before publishing replacement handles, the LSM
+WAL is synced before the manifest marks the source obsolete, and reclamation is
+delayed by snapshots and active-source reservations. The bounded Z3 model for
+these ordering and concurrency rules lives in `formal/`.
 
 ## Writer group
 

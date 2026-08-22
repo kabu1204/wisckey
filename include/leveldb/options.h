@@ -169,6 +169,12 @@ struct LEVELDB_EXPORT Options {
   // Default: 600s
   int blob_gc_interval = 600;
 
+  // Maximum number of value-log garbage-collection jobs that may run in
+  // parallel. The implementation currently supports one or two jobs. Keeping
+  // the default at one preserves the historical serial-GC behavior.
+  // Default: 1
+  int blob_max_background_gc = 1;
+
   // Number of background read threads for concurrent prefetch during
   // iteration. Prefetch is opt-in because it is slower for cached scans.
   // Default: 0

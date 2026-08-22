@@ -9,6 +9,33 @@ permissions:
   contents: read
 
 jobs:
+  formal:
+    name: Z3 formal maintenance checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.13'
+    - name: Install pinned uv
+      run: python -m pip install uv==0.12.5
+    - name: Check formal lockfile
+      working-directory: formal
+      run: uv lock --check
+    - name: Sync formal environment
+      working-directory: formal
+      run: uv sync --frozen
+    - name: Lint formal model
+      working-directory: formal
+      run: uv run --frozen ruff check .
+    - name: Test formal model
+      working-directory: formal
+      run: uv run --frozen pytest
+    - name: Check inferred GC policy and negative controls
+      working-directory: formal
+      run: uv run --frozen python -m maintenance.check
+
   build-and-test:
     name:  >-
       CI

@@ -127,6 +127,13 @@ class VLogRWFile {
 class ValueLogGCWriteCallback;
 struct GarbageCollection;
 
+// Pairwise runtime guard mirrored by formal/maintenance/policy.py. Source file
+// zero denotes an empty scan and is never a parallel collection candidate.
+inline bool CanRunVLogGCConcurrently(uint64_t lhs_source,
+                                     uint64_t rhs_source) {
+  return lhs_source != 0 && rhs_source != 0 && lhs_source != rhs_source;
+}
+
 /*
  * thread-safe for 1 Add() and N Get()
  */
@@ -244,13 +251,15 @@ class ValueLogImpl {
 
   Status Rewrite(GarbageCollection* gc);
 
-  static void BGWork(void* vlog);
+  static void BGWork(void* task);
 
-  void BGCall();
+  void BGCall(GarbageCollection* gc, bool periodic, uint64_t job_id);
 
   void MaybeScheduleGC();
 
-  void BackgroundGC();
+  void ScheduleGC(GarbageCollection* gc, bool periodic);
+
+  Status BackgroundGC(GarbageCollection* gc);
 
   void StartGCThread();
 
@@ -260,7 +269,7 @@ class ValueLogImpl {
 
   void GCThread();
 
-  void RecordBGError(Status&& s);
+  void RecordBGError(uint64_t job_id, const Status& s);
 
   struct ByFileNumber {
     bool operator()(VLogFileMeta* lhs, VLogFileMeta* rhs) const {
@@ -311,17 +320,25 @@ class ValueLogImpl {
   std::map<uint64_t, size_t> pending_publications_
       GUARDED_BY(publication_mutex_);
   std::set<uint64_t> deferred_gc_files_ GUARDED_BY(rwlock_);
+  // Sources are reserved before their jobs enter the Env queue. Distinct
+  // source files are the runtime form of the Z3-checked parallelism guard.
+  std::set<uint64_t> active_gc_files_ GUARDED_BY(rwlock_);
   uint64_t gc_pointer_;
 
   port::Mutex mutex_;  // only used to protect following members
   port::CondVar bg_work_cv_
       GUARDED_BY(mutex_);  // synchronize GC thread and foreground threads
-  bool bg_garbage_collection_ GUARDED_BY(mutex_);
+  size_t bg_gc_jobs_ GUARDED_BY(mutex_) = 0;
+  bool periodic_gc_active_ GUARDED_BY(mutex_) = false;
+  bool periodic_gc_paused_ GUARDED_BY(mutex_) = false;
+  size_t periodic_gc_jobs_ GUARDED_BY(mutex_) = 0;
+  uint64_t next_gc_job_id_ GUARDED_BY(mutex_) = 1;
+  uint64_t bg_error_job_id_ GUARDED_BY(mutex_) = 0;
   TimePoint gc_last_run_ GUARDED_BY(mutex_);
   Status bg_error_ GUARDED_BY(mutex_);
   // Coalesce duplicate requests without dropping requests for other files.
-  // BackgroundGC removes one entry at a time and BGCall reschedules while the
-  // set remains non-empty.
+  // MaybeScheduleGC removes requests as it reserves their source files and
+  // fills the configured worker slots.
   std::set<uint64_t> manual_gc_files_ GUARDED_BY(mutex_);
 
   // A dedicated lightweight timer triggers GC scheduling. Actual GC work

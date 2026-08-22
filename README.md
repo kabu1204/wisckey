@@ -24,6 +24,9 @@ BlobDB does **NOT SUPPORT Windows**.
 
 See [doc/blobdb_impl.md](./doc/blobdb_impl.md)
 
+The bounded Z3 model for parallel value-log GC is documented in
+[formal/README.md](./formal/README.md).
+
 ## Benchmarks with LevelDB
 
 See [doc/blobdb_benchmarks.md](./doc/blobdb_benchmarks.md)

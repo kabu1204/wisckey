@@ -149,13 +149,26 @@ struct GarbageCollection {
   Status s;
 };
 
-void ValueLogImpl::BGWork(void* vlog) {
-  reinterpret_cast<ValueLogImpl*>(vlog)->BGCall();
+namespace {
+
+struct GCBackgroundTask {
+  ValueLogImpl* vlog;
+  GarbageCollection* gc;
+  bool periodic;
+  uint64_t job_id;
+};
+
+}  // namespace
+
+void ValueLogImpl::BGWork(void* arg) {
+  GCBackgroundTask* task = reinterpret_cast<GCBackgroundTask*>(arg);
+  task->vlog->BGCall(task->gc, task->periodic, task->job_id);
+  delete task;
 }
 
 /*
- * Automatic GC visits one read-only vlog per configured interval. Selection
- * currently walks file numbers in order.
+ * Automatic GC visits up to blob_max_background_gc read-only vlogs per
+ * configured interval. Selection currently walks file numbers in order.
  *
  * TODO: The following policies may improve source selection:
  *  1. utilize LSM compaction statistics to select file. (deleted/overwritten
@@ -164,77 +177,177 @@ void ValueLogImpl::BGWork(void* vlog) {
  *  3. BG collect is cheaper than rewrite, we can compute scores for each file
  * to guide our GC.
  */
-void ValueLogImpl::BGCall() {
-  MutexLock l(&mutex_);
-  assert(bg_garbage_collection_);
-  if (shutdown_.load(std::memory_order_acquire)) {
-    // shutting down value log
-  } else if (!bg_error_.ok() && !bg_error_.IsNonFatal()) {
-    // stop
-    Log(options_.info_log, "Fatal BGError: %s", bg_error_.ToString().c_str());
-  } else {
-    mutex_.Unlock();
-    BackgroundGC();
-    mutex_.Lock();
+void ValueLogImpl::BGCall(GarbageCollection* gc, bool periodic,
+                          uint64_t job_id) {
+  bool run = false;
+  {
+    MutexLock l(&mutex_);
+    assert(bg_gc_jobs_ > 0);
+    if (!shutdown_.load(std::memory_order_acquire) &&
+        (bg_error_.ok() || bg_error_.IsNonFatal())) {
+      run = true;
+    } else if (!bg_error_.ok() && !bg_error_.IsNonFatal()) {
+      Log(options_.info_log, "Fatal BGError: %s",
+          bg_error_.ToString().c_str());
+    }
   }
 
-  bg_garbage_collection_ = false;
-  MaybeScheduleGC();
-  bg_work_cv_.SignalAll();
+  Status s;
+  if (run) {
+    s = BackgroundGC(gc);
+  }
+
+  // Release the source reservation only after the job has stopped reading and
+  // publishing it. Reclamation then sees every other active source and keeps
+  // those files pinned.
+  {
+    WriteLock l(&rwlock_);
+    if (gc != nullptr) {
+      const size_t erased = active_gc_files_.erase(gc->number);
+      assert(erased == 1);
+      (void)erased;
+    }
+    if (run && (s.ok() || s.IsNonFatal())) {
+      RemoveObsoleteFiles();
+    }
+  }
+
+  {
+    MutexLock l(&mutex_);
+    RecordBGError(job_id, s);
+    assert(bg_gc_jobs_ > 0);
+    --bg_gc_jobs_;
+    if (periodic) {
+      assert(periodic_gc_jobs_ > 0);
+      --periodic_gc_jobs_;
+      if (periodic_gc_jobs_ == 0) {
+        periodic_gc_active_ = false;
+        gc_last_run_ = TimePoint::clock::now();
+      }
+    } else {
+      // Preserve the historical behavior in which a completed manual attempt
+      // postpones the next periodic pass.
+      gc_last_run_ = TimePoint::clock::now();
+    }
+
+    if (!s.ok() && !s.IsNonFatal()) {
+      manual_gc_files_.clear();
+    }
+    MaybeScheduleGC();
+    bg_work_cv_.SignalAll();
+  }
+  delete gc;
 }
 
 void ValueLogImpl::MaybeScheduleGC() {
   mutex_.AssertHeld();
-  if (bg_garbage_collection_) {
-    // Allow only one GC job at a time.
-  } else if (shutdown_.load(std::memory_order_acquire)) {
-    // shutting down value log
-  } else if (!bg_error_.ok() && !bg_error_.IsNonFatal()) {
-    // stop
+  if (shutdown_.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (!bg_error_.ok() && !bg_error_.IsNonFatal()) {
     Log(options_.info_log, "Fatal BGError: %s", bg_error_.ToString().c_str());
-  } else {
-    TimePoint now = TimePoint::clock::now();
-    std::chrono::duration<int> duration =
-        std::chrono::duration_cast<std::chrono::seconds>(now - gc_last_run_);
-    const bool periodic_gc_due =
-        options_.blob_gc_interval > 0 &&
-        duration.count() >= options_.blob_gc_interval;
-    if (!manual_gc_files_.empty() || periodic_gc_due) {
-      bg_garbage_collection_ = true;
-      env_->Schedule(&ValueLogImpl::BGWork, this);
+    manual_gc_files_.clear();
+    return;
+  }
+
+  const size_t max_jobs = static_cast<size_t>(options_.blob_max_background_gc);
+  auto reserve_source = [this](uint64_t requested,
+                               bool block_if_requested_source_is_active,
+                               bool* blocked) {
+    WriteLock l(&rwlock_);
+    *blocked = block_if_requested_source_is_active && requested != 0 &&
+               active_gc_files_.count(requested) != 0;
+    if (*blocked) {
+      return static_cast<GarbageCollection*>(nullptr);
     }
+    GarbageCollection* gc = PickGC(requested);
+    if (gc != nullptr) {
+      for (uint64_t active : active_gc_files_) {
+        if (!CanRunVLogGCConcurrently(active, gc->number)) {
+          delete gc;
+          return static_cast<GarbageCollection*>(nullptr);
+        }
+      }
+      const bool inserted = active_gc_files_.insert(gc->number).second;
+      if (!inserted) {
+        delete gc;
+        return static_cast<GarbageCollection*>(nullptr);
+      }
+    }
+    return gc;
+  };
+
+  auto request = manual_gc_files_.begin();
+  while (bg_gc_jobs_ < max_jobs && request != manual_gc_files_.end()) {
+    const uint64_t requested_number = *request;
+    bool blocked = false;
+    GarbageCollection* gc =
+        reserve_source(requested_number, true, &blocked);
+    if (blocked) {
+      // Keep an exact request queued until the current job releases that
+      // source. Other distinct manual requests may still fill empty slots.
+      ++request;
+      continue;
+    }
+    request = manual_gc_files_.erase(request);
+    ScheduleGC(gc, false);
+  }
+
+  TimePoint now = TimePoint::clock::now();
+  std::chrono::duration<int> duration =
+      std::chrono::duration_cast<std::chrono::seconds>(now - gc_last_run_);
+  const bool periodic_gc_due =
+      !periodic_gc_paused_ && options_.blob_gc_interval > 0 &&
+      duration.count() >= options_.blob_gc_interval;
+  if (bg_gc_jobs_ >= max_jobs || !manual_gc_files_.empty() ||
+      periodic_gc_active_ || !periodic_gc_due) {
+    return;
+  }
+
+  periodic_gc_active_ = true;
+  size_t scheduled = 0;
+  while (bg_gc_jobs_ < max_jobs) {
+    bool blocked = false;
+    GarbageCollection* gc = reserve_source(gc_pointer_, false, &blocked);
+    assert(!blocked);
+    if (gc == nullptr) {
+      gc_pointer_ = 0;
+      // Preserve the observable empty-scan pass and its rate limiting.
+      if (scheduled == 0) {
+        ScheduleGC(nullptr, true);
+      }
+      break;
+    }
+    gc_pointer_ = gc->number + 1;
+    ScheduleGC(gc, true);
+    ++scheduled;
   }
 }
 
-void ValueLogImpl::BackgroundGC() {
+void ValueLogImpl::ScheduleGC(GarbageCollection* gc, bool periodic) {
+  mutex_.AssertHeld();
+  if (bg_gc_jobs_ == 0 && bg_error_.IsNonFatal()) {
+    // A NonFatal result remains observable until a new maintenance wave is
+    // actually scheduled. The new wave then starts with a clean aggregate.
+    bg_error_ = Status::OK();
+    bg_error_job_id_ = 0;
+  }
+  const uint64_t job_id = next_gc_job_id_++;
+  ++bg_gc_jobs_;
+  if (periodic) {
+    ++periodic_gc_jobs_;
+  }
+  GCBackgroundTask* task = new GCBackgroundTask{this, gc, periodic, job_id};
+  env_->Schedule(&ValueLogImpl::BGWork, task);
+}
+
+Status ValueLogImpl::BackgroundGC(GarbageCollection* gc) {
   TEST_SYNC_POINT("GC.BeforeBackground");
-
-  bool manual = false;
-  uint64_t requested_number = 0;
-  {
-    MutexLock l(&mutex_);
-    if (!manual_gc_files_.empty()) {
-      manual = true;
-      auto request = manual_gc_files_.begin();
-      requested_number = *request;
-      manual_gc_files_.erase(request);
-    }
-  }
-
-  rwlock_.WLock();
-  GarbageCollection* gc;
-  if (manual) {
-    gc = PickGC(requested_number);
-  } else {
-    gc = PickGC(gc_pointer_);
-    gc_pointer_ = gc ? gc->number + 1 : 0;
-  }
-  rwlock_.WUnlock();
 
   Status s;
   if (!gc) {
-    // This is a normal idle state, not an error. Advancing gc_last_run_ below
-    // prevents BGCall() from immediately scheduling the same empty scan.
+    // This is a normal idle state, not an error. BGCall advances the periodic
+    // epoch timestamp when its final task completes.
     s = Status::OK();
   } else {
     s = Collect(gc);
@@ -244,28 +357,22 @@ void ValueLogImpl::BackgroundGC() {
     }
   }
 
-  if (s.ok() || s.IsNonFatal()) {
-    // Reclaim files whose last possible LSM snapshot has expired. Run this for
-    // idle scans too, so snapshot release does not require another eligible
-    // source file or a foreground write before disk space is reclaimed.
-    WriteLock l(&rwlock_);
-    RemoveObsoleteFiles();
-  }
-
-  {
-    MutexLock l(&mutex_);
-    // Rate-limit complete GC attempts, including empty scans, threshold misses,
-    // and non-fatal failures. Manual requests still bypass this timestamp.
-    gc_last_run_ = TimePoint::clock::now();
-  }
-
-  RecordBGError(std::move(s));
-  delete gc;
+  return s;
 }
 
-void ValueLogImpl::RecordBGError(Status&& s) {
-  MutexLock l(&mutex_);
-  bg_error_ = std::move(s);
+void ValueLogImpl::RecordBGError(uint64_t job_id, const Status& s) {
+  mutex_.AssertHeld();
+  if (s.ok()) {
+    return;
+  }
+  const bool new_fatal = !s.IsNonFatal();
+  const bool old_fatal = !bg_error_.ok() && !bg_error_.IsNonFatal();
+  if ((new_fatal && !old_fatal) ||
+      (new_fatal == old_fatal &&
+       (bg_error_job_id_ == 0 || job_id < bg_error_job_id_))) {
+    bg_error_ = s;
+    bg_error_job_id_ = job_id;
+  }
 }
 
 // Pick the first eligible read-only vlog whose file number is at least number.
@@ -279,7 +386,8 @@ GarbageCollection* ValueLogImpl::PickGC(uint64_t number) {
           static_cast<unsigned long long>(number));
       return nullptr;
     }
-    if (obsolete_files_.find(it->first) == obsolete_files_.end()) {
+    if (obsolete_files_.find(it->first) == obsolete_files_.end() &&
+        active_gc_files_.find(it->first) == active_gc_files_.end()) {
       if (HasPendingPublication(it->first)) {
         deferred_gc_files_.insert(it->first);
         number = it->first + 1;
@@ -313,13 +421,23 @@ Status ValueLogImpl::RunGC() {
   // makes a full maintenance pass visit each file that existed at entry at
   // most once, and never loops over replacement files created by the pass.
   StopGCThread();
-  auto restart_gc_timer = [this] { StartGCThread(); };
+  {
+    MutexLock l(&mutex_);
+    periodic_gc_paused_ = true;
+  }
+  auto restart_gc_timer = [this] {
+    {
+      MutexLock l(&mutex_);
+      periodic_gc_paused_ = false;
+    }
+    StartGCThread();
+  };
   ScopeExit<decltype(restart_gc_timer)> restart_timer(restart_gc_timer);
 
   Status result;
   {
     MutexLock l(&mutex_);
-    while (bg_garbage_collection_) {
+    while (bg_gc_jobs_ != 0) {
       bg_work_cv_.Wait();
     }
     if (!bg_error_.ok() && !bg_error_.IsNonFatal()) {
@@ -347,33 +465,21 @@ Status ValueLogImpl::RunGC() {
     }
   }
 
-  for (uint64_t number : sources) {
-    {
-      WriteLock l(&rwlock_);
-      if (ro_files_.count(number) == 0 || obsolete_files_.count(number) != 0) {
-        continue;
-      }
-      // A rolled file can still have an unpublished handle batch. Never
-      // collect it until that writer leaves DBImpl's publication queue.
-      if (HasPendingPublication(number)) {
-        deferred_gc_files_.insert(number);
-        continue;
-      }
+  {
+    MutexLock l(&mutex_);
+    for (uint64_t number : sources) {
+      manual_gc_files_.insert(number);
     }
-
-    ManualGC(number);
-    {
-      MutexLock l(&mutex_);
-      while (bg_garbage_collection_) {
-        bg_work_cv_.Wait();
-      }
-      if (!bg_error_.ok() && !bg_error_.IsNonFatal()) {
-        result = bg_error_;
-      }
+    MaybeScheduleGC();
+    while (bg_gc_jobs_ != 0 || !manual_gc_files_.empty()) {
+      bg_work_cv_.Wait();
     }
-    if (!result.ok()) {
-      return result;
+    if (!bg_error_.ok() && !bg_error_.IsNonFatal()) {
+      result = bg_error_;
     }
+  }
+  if (!result.ok()) {
+    return result;
   }
 
   {
